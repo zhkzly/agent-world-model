@@ -87,3 +87,19 @@ and [config surface](https://github.com/verl-project/verl/blob/483b8a009ba3a9756
 
 This is one current trust-boundary consumer, not a sampler framework. A version
 or trainer-mode change requires a new compatibility review.
+
+## Pinned V1 reward-loop correction
+
+The v0.9 AgentLoop worker calls `_compute_score` whenever its output reward is
+`None` and reward-loop handles are non-null. `RewardLoopManager` returns handles
+by default when the reward model is disabled (`reward.num_workers` defaults to
+8); setting that count to zero produces an empty non-null list and fails at
+`random.choice`, so it is not a disable switch.
+
+The exact native hook is `reward.custom_reward_function`. The naive reward
+manager merges `AgentLoopOutput.extra_fields` into `extra_info`, so CP2's
+`episode_id` and `rollout_receipt` reach one configured function without a new
+service or trainer. CP3 must use that function only to cold-read the canonical
+receipt: return numeric S3 truth, raise on `null`/tamper, then have the custom
+sampler cross-check the same receipt against TransferQueue before materializing
+the one `G=2` group.

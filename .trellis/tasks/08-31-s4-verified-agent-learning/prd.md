@@ -149,10 +149,37 @@ trainer.use_v1=true
 trainer.v1.trainer_mode=sync
 data.train_batch_size=1 prompt group
 data.gen_batch_size=1 prompt group
-actor_rollout_ref.rollout.n=G
+actor_rollout_ref.rollout.n=2
+trainer.v1.sampler.custom_sampler.path=pkg://agent_env_foundry.verl_agent_loop
+trainer.v1.sampler.custom_sampler.name=FoundryFailClosedReplayBuffer
+trainer.v1.sampler.sampler_kwargs.group_size=2
 trainer.v1.sampler.sync_refill_failed_groups=false
 algorithm.filter_groups.enable=false
+reward.num_workers=1
+reward.custom_reward_function.path=pkg://agent_env_foundry.verl_agent_loop
+reward.custom_reward_function.name=compute_s3_receipt_reward
 ```
+
+For this single proof group, freeze `G=2`: the smallest cardinality that can
+carry a nonzero binary GRPO signal. An all-equal pair returns
+`NO_GRPO_SIGNAL`; it is not enlarged or resampled to manufacture variance.
+
+Pinned v0.9 V1 creates reward-loop workers in the normal
+`reward_model.enable=false` path. Leaving an abstain as
+`AgentLoopOutput.reward_score=None` therefore invokes upstream default scoring,
+while `reward.num_workers=0` leaves a non-null empty handle list and crashes.
+The GRPO config must instead select one exact Foundry custom reward function
+through the native `reward.custom_reward_function` hook. That function only
+cold-reads the CP2 rollout receipt: numeric S3 `0.0/1.0` is returned unchanged;
+`null`, malformed or mismatched evidence raises before a successful trajectory
+is published to TransferQueue. It does not inspect model text or recompute Task
+truth.
+
+Every GRPO prompt row also carries the two standard fields the pinned naive
+reward manager reads before invoking the custom function:
+`data_source="s3_receipt"` and
+`reward_model={"ground_truth": null}`. They convey no answer key and the
+receipt function ignores both values.
 
 Stock v0.9 sync ReplayBuffer may sample/pad failed groups. S4 therefore adds one
 pin-specific `FoundryFailClosedReplayBuffer` through the documented custom
@@ -188,7 +215,7 @@ src/agent_env_foundry/verl_sft_dataset.py
   exact-pin decode-only MultiTurnSFTDataset subclass
 
 src/agent_env_foundry/verl_agent_loop.py
-  PolicyDriver AgentLoop + FoundryFailClosedReplayBuffer
+  PolicyDriver AgentLoop + receipt reward reader + FoundryFailClosedReplayBuffer
 
 scripts/s4_collect.py
 one SFT config

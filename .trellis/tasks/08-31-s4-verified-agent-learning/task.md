@@ -111,3 +111,7 @@ Acceptance: four checkpoints pass real physical exits, mutation licences, drift 
 - CP3 pin constraint discovered: stock V1 creates reward-loop workers in the normal reward-model-disabled path and overwrites `reward_score=None`; `reward.num_workers=0` instead leaves an empty non-null handle list and crashes.
 - CP3 must separately review a pin-native way to consume and cross-check the S3 rollout receipt before optimization; sentinel reward, abstain-to-zero and a guessed "disable worker" setting are rejected.
 - Reconsider the CP3 reward handoff only if the exact pinned trainer exposes another proven path that preserves S3 `1.0/0.0/null` without recomputation.
+- Chosen for CP3: exact `G=2`, one native custom reward function that reads the CP2 receipt, and the already-approved custom sampler cross-checking the same receipt before materialization.
+- Alternative rejected: stock default scoring, `reward.num_workers=0`, sentinel/zero abstention, survivor filtering, group enlargement or a new reward/trainer service.
+- Reconsider only if the pinned hooks cannot expose `extra_info`/TransferQueue fields proven in the exact-source review, or a new veRL pin changes those contracts.
+- CP3 plan correction review: ACCEPTED after replacing the sampler's bare class name with exact `pkg://` path/name keys and requiring standard input fields `data_source="s3_receipt"` plus `reward_model.ground_truth=null`.

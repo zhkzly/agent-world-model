@@ -347,20 +347,38 @@ save/reload the checkpoint and continue a fresh S3 rollout.
 entrypoint: python -m verl.trainer.main_ppo
 trainer.use_v1: true
 trainer.v1.trainer_mode: sync
-trainer.v1.sampler.custom_sampler: FoundryFailClosedReplayBuffer
+trainer.v1.sampler.custom_sampler.path: pkg://agent_env_foundry.verl_agent_loop
+trainer.v1.sampler.custom_sampler.name: FoundryFailClosedReplayBuffer
+trainer.v1.sampler.sampler_kwargs.group_size: 2
 trainer.v1.sampler.sync_refill_failed_groups: false
 data.train_batch_size: 1
 data.gen_batch_size: 1
-actor_rollout_ref.rollout.n: G
+actor_rollout_ref.rollout.n: 2
 algorithm.adv_estimator: grpo
 algorithm.filter_groups.enable: false
-reward: S3 terminal 1.0/0.0 only
+reward.num_workers: 1
+reward.reward_model.enable: false
+reward.custom_reward_function.path: pkg://agent_env_foundry.verl_agent_loop
+reward.custom_reward_function.name: compute_s3_receipt_reward
+reward: exact cold S3 receipt 1.0/0.0 only; null raises before TQ success
 ```
 
-Add `FoundryFailClosedReplayBuffer` inside `verl_agent_loop.py`. At the exact-pin
-`_sampleable_terminal_keys` gate, reject failed/incomplete/non-numeric/all-equal
-groups before materialization. Never pad, refill, retry, filter survivors or
-replace siblings.
+GRPO input rows must include `data_source="s3_receipt"` and
+`reward_model={"ground_truth": null}` because the pinned naive manager reads
+both before calling the configured function. The function ignores them and
+uses only `extra_info.episode_id/rollout_receipt`.
+
+Freeze `G=2`. Add only `compute_s3_receipt_reward`, the strict private receipt
+reader it shares with `FoundryFailClosedReplayBuffer`, and that sampler inside
+`verl_agent_loop.py`. The reward function uses the pinned native hook and
+returns a numeric receipt reward unchanged; abstain/tamper raises so V1 marks
+the prompt root failed. At the exact-pin `_sampleable_terminal_keys` gate, the
+sampler rejects failed/incomplete/non-numeric/all-equal groups and cross-checks
+TransferQueue response IDs/masks/reward metadata against both receipts before
+materialization. Never pad, refill, retry, filter survivors or replace siblings.
+The two top-level no-refill/filter settings remain explicit configuration
+guards; because v0.9 does not forward them into a custom sampler, the subclass
+itself owns and tests the raise-only semantics using `sampler_kwargs.group_size`.
 
 ### Behavioral RED
 
@@ -369,6 +387,11 @@ First test:
 ```text
 tests/test_verl_agent_loop.py::test_abstain_aborts_v1_step_without_parameter_change
 ```
+
+The CPU RED must reach both native seams: receipt reward loading rejects
+`null`, and the custom sampler rejects a failed root even when a numeric sibling
+trajectory survived. No optimizer/GPU double substitutes for the later physical
+unchanged-digest proof.
 
 Then cover:
 
@@ -401,6 +424,8 @@ unchanged parameter digest.
 
 - no complete nonzero-signal group exists;
 - stock/custom sampler behavior cannot guarantee whole-step fail closed;
+- the pinned reward loop cannot propagate numeric receipts and turn null into a
+  failed root before materialization;
 - checkpoint/rollout weights do not save, load or synchronize;
 - only shaping, retry or S3 truth changes could make progress.
 
