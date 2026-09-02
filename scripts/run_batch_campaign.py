@@ -231,6 +231,7 @@ def _run_need(
     record["finished_at"] = _utc_now()
     record["elapsed_ms"] = (time.monotonic_ns() - started) // 1_000_000
     record["record_id"] = _digest(record)
+    _atomic_write(attempt / "terminal.json", record)
     _atomic_write(record_path, record)
     _print(
         {
@@ -307,7 +308,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--suite", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--workers", type=int, default=3)
+    parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.workers <= 4:

@@ -917,6 +917,8 @@ def _run_fresh_json_turn(
 
 
 def _retryable_provider_failure(exc: Exception) -> bool:
+    if "auth_unavailable" in str(exc) and "no auth available" in str(exc):
+        return False
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and status in {408, 409, 429, 500, 502, 503, 504}:
         return True

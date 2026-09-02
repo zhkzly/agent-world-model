@@ -38,6 +38,12 @@ input file.
    without prohibited mutation, reset, reload, instance isolation, and the
    absence of complete query-answer leakage from reset. Tests must also prove
    `read_state` schema conformance, deterministic repeated reads and no mutation.
+   Validate the complete `read_state` value immediately after reset and after
+   representative mutations, including every legitimately nullable regime.
+   Use a reset-owned logical clock/counter/seed; never persist ambient wall
+   time, random UUIDs, OS entropy, or unseeded randomness. Replay the same
+   mutating sequence in two fresh instances and require identical observations
+   and protected state.
    For every public tool, execute at least one representative real observation
    and validate its fixed success/refusal envelope. On success, validate only
    `observation["data"]` against that ToolSpec's `output_schema`; never wrap the

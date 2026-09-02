@@ -378,6 +378,16 @@ def test_default_responses_client_has_a_bounded_turn_timeout(
     assert captured["max_retries"] == 0
 
 
+def test_auth_unavailable_is_not_retried_inside_one_research_turn() -> None:
+    class Unavailable(RuntimeError):
+        status_code = 503
+
+    assert not agents_module._retryable_provider_failure(
+        Unavailable("auth_unavailable: no auth available")
+    )
+    assert agents_module._retryable_provider_failure(Unavailable("temporary upstream outage"))
+
+
 def test_missing_invocation_credential_is_typed_and_secret_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -42,6 +42,7 @@ _EXPECTED_BUILDER_PHASES = (
     "build",
     "tests",
     "public_contract",
+    "source_determinism",
     "live_contract",
 )
 _FORBIDDEN_ACTOR_MODULES = (

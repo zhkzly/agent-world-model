@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -17,8 +18,6 @@ from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
 from agent_env_foundry.physical_runtime import (
     PreparationSettings,
-    ProjectMaterializationInput,
-    read_actor_tool_catalog,
 )
 from agent_env_foundry.project_identity import (
     ProjectIdentityError,
@@ -55,10 +54,39 @@ RESET_OBSERVATION_SCHEMA_PATH = Path("docs/schemas/reset.json")
 STATE_SCHEMA_PATH = Path("docs/schemas/state.json")
 _CODEX_PROVIDER_ID = "foundry_runtime"
 _AMBIENT_PYTHON_ENV = ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME")
-_ACTOR_FORBIDDEN_MODULES = (
-    "agent_env_foundry",
-    "generated_task_semantics",
-    "generated_qualification_verifier",
+_BUILDER_PREFLIGHT_PHASES = (
+    "lock",
+    "sync",
+    "build",
+    "tests",
+    "public_contract",
+    "source_determinism",
+)
+_AMBIENT_ENTROPY_CALLS = frozenset(
+    {
+        "datetime.date.today",
+        "datetime.datetime.now",
+        "datetime.datetime.today",
+        "datetime.datetime.utcnow",
+        "os.urandom",
+        "random.choice",
+        "random.choices",
+        "random.getrandbits",
+        "random.randint",
+        "random.random",
+        "random.randrange",
+        "random.shuffle",
+        "random.uniform",
+        "secrets.choice",
+        "secrets.randbelow",
+        "secrets.token_bytes",
+        "secrets.token_hex",
+        "secrets.token_urlsafe",
+        "time.time",
+        "time.time_ns",
+        "uuid.uuid1",
+        "uuid.uuid4",
+    }
 )
 
 
@@ -306,7 +334,10 @@ def run_candidate_checks(root: Path, config: BuilderConfig) -> tuple[CommandResu
     results.append(_public_contract_check(root))
     if not results[-1].passed:
         return tuple(results)
-    results.append(_live_actor_contract_check(root, config))
+    results.append(_source_determinism_check(root))
+    if not results[-1].passed:
+        return tuple(results)
+    results.append(_live_actor_contract_check(root, config, tuple(results)))
     return tuple(results)
 
 
@@ -348,21 +379,107 @@ def _public_contract_check(root: Path) -> CommandResult:
     )
 
 
-def _live_actor_contract_check(root: Path, config: BuilderConfig) -> CommandResult:
-    """Run the exact Host ToolSpec decoder while the Builder can still repair."""
+def _source_determinism_check(root: Path) -> CommandResult:
+    """Reject ambient entropy that cannot be replayed from release state."""
+
+    failures: list[dict[str, Any]] = []
+    for path in sorted((root / "src").rglob("*.py")):
+        relative = path.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+        except (OSError, SyntaxError) as exc:
+            failures.append(
+                {
+                    "path": relative,
+                    "line": getattr(exc, "lineno", None),
+                    "call": "invalid_python_source",
+                    "message": str(exc),
+                }
+            )
+            continue
+        bindings: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    local = alias.asname or alias.name.partition(".")[0]
+                    bindings[local] = alias.name if alias.asname else local
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    if alias.name != "*":
+                        bindings[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            reference = _call_reference(node.func, bindings)
+            unseeded_random = reference == "random.Random" and not node.args and not node.keywords
+            if reference not in _AMBIENT_ENTROPY_CALLS and not unseeded_random:
+                continue
+            failures.append(
+                {
+                    "path": relative,
+                    "line": node.lineno,
+                    "call": reference,
+                    "message": (
+                        "actor state and observations must derive time/IDs/randomness from "
+                        "resettable instance state"
+                    ),
+                }
+            )
+    return CommandResult(
+        "source_determinism",
+        ("host", "scan-actor-determinism"),
+        1 if failures else 0,
+        "" if failures else "actor source contains no ambient entropy calls",
+        json.dumps(failures, ensure_ascii=False, sort_keys=True) if failures else "",
+    )
+
+
+def _call_reference(node: ast.expr, bindings: dict[str, str]) -> str:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return ""
+    root = bindings.get(current.id, current.id)
+    return ".".join((root, *reversed(parts)))
+
+
+def _live_actor_contract_check(
+    root: Path,
+    config: BuilderConfig,
+    prior_checks: tuple[CommandResult, ...] | None = None,
+) -> CommandResult:
+    """Run complete task-neutral conformance while Codex can still repair."""
 
     try:
         digest = compute_candidate_digest(root)
-        tools = read_actor_tool_catalog(
-            ProjectMaterializationInput(
-                root,
-                digest,
-                "generated_environment",
-                _ACTOR_FORBIDDEN_MODULES,
-                "actor",
-            ),
-            root.parent / ".builder-contract-runtimes" / digest,
-            factory=ACTOR_FACTORY,
+        checks = prior_checks or tuple(
+            CommandResult(phase, ("host", f"preflight-{phase}"), 0, "passed", "")
+            for phase in _BUILDER_PREFLIGHT_PHASES
+        )
+        placeholder = CommandResult(
+            "live_contract",
+            ("host", "validate-live-actor-contract"),
+            0,
+            "preflight placeholder",
+            "",
+        )
+        candidate = CandidateBuild(
+            root,
+            "builder-live-preflight",
+            digest,
+            "",
+            (*checks, placeholder),
+        )
+        from agent_env_foundry.environment_conformance_v3 import (
+            run_environment_conformance_v3_internal,
+        )
+
+        conformed = run_environment_conformance_v3_internal(
+            candidate,
+            root.parent / ".builder-conformance-runtimes" / digest,
             settings=PreparationSettings(
                 config.uv_cache_dir,
                 config.command_timeout_seconds,
@@ -388,7 +505,7 @@ def _live_actor_contract_check(root: Path, config: BuilderConfig) -> CommandResu
         ("host", "validate-live-actor-contract"),
         0,
         json.dumps(
-            {"tool_names": [item["name"] for item in tools]},
+            {"tool_names": [item["name"] for item in conformed.tool_specs]},
             ensure_ascii=False,
             sort_keys=True,
         ),

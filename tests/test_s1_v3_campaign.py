@@ -95,3 +95,4 @@ def test_s1_v3_campaign_preserves_unexpected_worker_failure(
     assert record["terminal"] == "worker_failed"
     assert record["code"] == "RuntimeError"
     assert (tmp_path / "records/need-a.json").is_file()
+    assert (tmp_path / "needs/need-a/attempts/attempt-001/terminal.json").is_file()

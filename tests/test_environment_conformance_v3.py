@@ -34,6 +34,7 @@ def _candidate(root: Path, *, phases: tuple[str, ...] | None = None) -> Candidat
         "build",
         "tests",
         "public_contract",
+        "source_determinism",
         "live_contract",
     )
     checks = tuple(CommandResult(phase, ("physical", phase), 0, "passed", "") for phase in selected)

@@ -502,7 +502,7 @@ def _wire_fake_toolchain(
     monkeypatch.setattr(
         builder_module,
         "_live_actor_contract_check",
-        lambda _root, _config: CommandResult(
+        lambda _root, _config, *_checks: CommandResult(
             "live_contract",
             ("host", "validate-live-actor-contract"),
             0,
@@ -543,6 +543,7 @@ def test_host_preparation_owns_installation_and_scrubs_ambient_python_env(
         "build",
         "tests",
         "public_contract",
+        "source_determinism",
         "live_contract",
     ]
     lines = log.read_text().splitlines()
@@ -648,6 +649,58 @@ def test_live_actor_contract_rejects_conflicting_input_root(tmp_path: Path) -> N
     assert 'root "type": "object"' in failure["message"]
 
 
+def test_live_actor_contract_rejects_reset_state_schema_drift(tmp_path: Path) -> None:
+    root = build_actor_project(tmp_path / "candidate")
+    state_schema = root / "docs/schemas/state.json"
+    document = json.loads(state_schema.read_text(encoding="utf-8"))
+    document["properties"]["count"] = {"type": "string"}
+    state_schema.write_text(json.dumps(document), encoding="utf-8")
+
+    result = builder_module._live_actor_contract_check(
+        root,
+        BuilderConfig(uv_cache_dir=tmp_path / "uv-cache"),
+    )
+
+    assert not result.passed
+    failure = json.loads(result.stderr)
+    assert failure["code"] == "state_snapshot_schema"
+
+
+def test_source_determinism_check_rejects_ambient_entropy_calls(tmp_path: Path) -> None:
+    root = tmp_path / "candidate"
+    source = root / "src/generated_environment/release.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "from datetime import datetime as clock\n"
+        "from uuid import uuid4 as new_id\n"
+        "def values():\n"
+        "    return clock.now(), new_id()\n",
+        encoding="utf-8",
+    )
+
+    result = builder_module._source_determinism_check(root)
+
+    assert not result.passed
+    failures = json.loads(result.stderr)
+    assert {item["call"] for item in failures} == {
+        "datetime.datetime.now",
+        "uuid.uuid4",
+    }
+
+
+def test_source_determinism_check_allows_explicit_logical_clock(tmp_path: Path) -> None:
+    root = tmp_path / "candidate"
+    source = root / "src/generated_environment/release.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "from datetime import datetime, timezone\n"
+        "EPOCH = datetime(2030, 1, 1, tzinfo=timezone.utc)\n",
+        encoding="utf-8",
+    )
+
+    assert builder_module._source_determinism_check(root).passed
+
+
 _CONTRACT_PATH = (
     Path(__file__).resolve().parents[1]
     / "src/agent_env_foundry/runtime_skills/environment-codegen/ENVIRONMENT_CONTRACT.md"
@@ -674,6 +727,9 @@ def test_contract_document_keeps_release_assembly_out_of_builder() -> None:
     assert "describes only the value inside a successful observation" in text
     assert "must never describe or repeat the outer" in text
     assert "independent backend truth" in text
+    assert "ambient wall clock" in text
+    assert "legitimately `null`" in text
+    assert "after every representative state-changing workflow" in text
     assert "execute every public tool" in text
     assert "exact ToolSpec" in text
     assert "Do not write `release.json`" in text

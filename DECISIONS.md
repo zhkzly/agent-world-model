@@ -261,3 +261,14 @@ an exact ToolObservation wrapper around `output_schema`, and Host-assigned
 instance-root replay projection. A malformed native Git history identifier was
 not normalized by Framework; Codex repaired the actor and added independent Git
 truth tests. No Task, checker, reward or domain branch entered S1.
+
+`s1-v3-20-need-campaign|介入1|返工3|42 attempts+20 unique Releases+204 tools+cross-attempt context audit|红线违反0`
+
+The exact official suite reached 20/20 current Releases without counting the
+two Checkpoint-D diagnostic Needs. The campaign exposed concurrency-three auth
+exhaustion, two schema/replay candidate defects and five post-release ambient
+clock defects. Final actors contain no raw ABI drift or ambient entropy calls.
+Known failures now become same-thread Builder preflight feedback through full
+environment Conformance and an AST entropy scan; Framework does not infer
+nullable domain semantics from one observed value. The evidence report states
+that S2 Task/reward and training-gain claims remain unproven.

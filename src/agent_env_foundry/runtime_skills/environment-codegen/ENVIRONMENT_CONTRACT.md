@@ -50,6 +50,9 @@ Every emitted public leaf in a reset result or successful ToolObservation
 array without an `items` schema cannot authorize its hidden descendants. Use
 self-contained schemas that type the actual identifiers, timestamps, statuses,
 relationships and other values the public Agent may read or reuse.
+If any emitted field is legitimately `null` in a reset regime, refusal detail,
+or post-transition state, its exact schema path must admit JSON null; never
+declare only the non-null steady-state type.
 
 ## State and reset
 
@@ -78,6 +81,11 @@ relationships and other values the public Agent may read or reuse.
 - Use real native persistent state under the supplied instance directory, such
   as SQLite or ordinary files appropriate to the selected world.
 - Separate instance directories are independent.
+- Time, generated identifiers, and randomized choices are part of environment
+  state. Do not call the ambient wall clock, random UUID, OS entropy, or an
+  unseeded random generator. Reset must reconstruct an environment-owned
+  logical clock/counter/seed, and identical public actions from identical reset
+  state must produce identical public observations and protected state.
 - Successful state-changing tools perform real native mutations.
 - Business refusals have stable domain error codes and perform every declared
   prohibited mutation exactly zero times.
@@ -111,6 +119,11 @@ without schema validation is insufficient. A dictionary response map,
 canned result, mock backend, empty world, repository template, Task, verifier,
 reward, trajectory, MCP, HTTP, or training-specific behavior does not satisfy
 this contract.
+
+Validate the complete protected `read_state` value against `state.json` both
+immediately after reset and after every representative state-changing workflow.
+Run the same representative mutating sequence in two fresh instance directories
+and compare the resulting observations and protected state exactly.
 
 For native identifiers and state projections, tests must compare the structured
 value with independent backend truth (for example the actual database row,

@@ -1,0 +1,48 @@
+{
+  "format": "s1-v3-resume-evidence/1",
+  "campaign_id": "e772f8032cbaf166d0edb4a6f119627cc63c0b25e93ca6fef5b02f2e4b6d4586",
+  "suite_digest": "0b80720439e271fea441585d010b39907e3de2824010f1f29d68c9a90294b294",
+  "source_commit": "1396cc5ebff71c0e32fa5102f758be07ddf6e33a",
+  "final_result": {
+    "need_count": 20,
+    "released": 20,
+    "release_rate": 1.0,
+    "unique_release_ids": 20,
+    "attempt_directories": 42,
+    "wall_clock_seconds": 12155.84
+  },
+  "generated_assets": {
+    "tool_count": 204,
+    "source_nonblank_loc": 2961,
+    "test_functions": 63,
+    "release_archive_bytes": 506217
+  },
+  "latency_ms": {
+    "end_to_end_mean": 881168,
+    "end_to_end_p50": 829533,
+    "end_to_end_p95": 1271205,
+    "research_mean": 538264,
+    "research_p50": 456807,
+    "research_p95": 961448,
+    "builder_mean": 277126,
+    "builder_p50": 270630,
+    "builder_p95": 368968,
+    "conformance_mean": 661,
+    "publication_mean": 74,
+    "cold_prepare_mean": 330
+  },
+  "recovery_evidence": {
+    "infrastructure_failed_attempts": 15,
+    "pre_release_actor_defects": 2,
+    "post_release_determinism_findings": 5,
+    "actor_repair_attempts": 7
+  },
+  "final_audit": {
+    "raw_tools_requiring_input_root_correction": 0,
+    "raw_tools_requiring_output_envelope_correction": 0,
+    "actors_with_ambient_entropy_calls": 0,
+    "cold_release_identity_failures": 0,
+    "extra_post_transition_state_schema_failures": 0
+  },
+  "claim_boundary": "This campaign demonstrates S1 EnvironmentRelease generation and physical conformance only; it does not claim S2 Task admission, reward correctness, or downstream training gain."
+}
