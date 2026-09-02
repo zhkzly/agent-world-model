@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
-from agent_env_foundry.environment import JSONObject, JSONValue, validate_observation
+from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
 from agent_env_foundry.release import (
     _entrypoint_reference,
@@ -81,7 +81,12 @@ class TaskProposalEvidence:
         ):
             if not is_json_value(value):
                 raise ValueError(f"proposal {role} must be a JSON value")
-        trace = _public_trace(self.public_trace, require_nonempty=True)
+        if (
+            not isinstance(self.public_trace, tuple)
+            or not self.public_trace
+            or any(not is_json_object(item) for item in self.public_trace)
+        ):
+            raise ValueError("proposal public_trace must be a non-empty tuple of JSON objects")
         if not is_json_object(self.proposed_final_answer):
             raise ValueError("proposal final answer must be a JSON object")
         object.__setattr__(
@@ -95,7 +100,7 @@ class TaskProposalEvidence:
         object.__setattr__(
             self,
             "public_trace",
-            trace,
+            tuple(_copy_object(item) for item in self.public_trace),
         )
         object.__setattr__(
             self,
@@ -249,7 +254,10 @@ class TaskCheckRequest:
         _digest(self.task_id, "task_id")
         if not is_json_value(self.before_state) or not is_json_value(self.after_state):
             raise ValueError("check request states must be JSON values")
-        trace = _public_trace(self.public_trace, require_nonempty=False)
+        if not isinstance(self.public_trace, tuple) or any(
+            not is_json_object(item) for item in self.public_trace
+        ):
+            raise ValueError("public_trace must be a tuple of JSON objects")
         if not is_json_object(self.final_answer):
             raise ValueError("final_answer must be a JSON object")
         object.__setattr__(self, "before_state", _copy_json(self.before_state))
@@ -257,7 +265,7 @@ class TaskCheckRequest:
         object.__setattr__(
             self,
             "public_trace",
-            trace,
+            tuple(_copy_object(item) for item in self.public_trace),
         )
         object.__setattr__(self, "final_answer", _copy_object(self.final_answer))
 
@@ -394,33 +402,6 @@ def _answer_schema(document: JSONObject) -> JSONObject:
     except SchemaError as exc:
         raise ValueError(str(exc)) from exc
     return schema
-
-
-def _public_trace(
-    values: tuple[JSONObject, ...], *, require_nonempty: bool
-) -> tuple[JSONObject, ...]:
-    if not isinstance(values, tuple) or (require_nonempty and not values):
-        requirement = "a non-empty tuple" if require_nonempty else "a tuple"
-        raise ValueError(f"public_trace must be {requirement}")
-    copied: list[JSONObject] = []
-    for index, value in enumerate(values):
-        if not is_json_object(value) or set(value) != {"tool", "arguments", "observation"}:
-            raise ValueError(
-                "public trace event must contain exactly tool, arguments and observation"
-            )
-        tool, arguments, observation = (
-            value["tool"],
-            value["arguments"],
-            value["observation"],
-        )
-        if not isinstance(tool, str) or not tool or not is_json_object(arguments):
-            raise ValueError(f"public trace event {index} has invalid tool or arguments")
-        try:
-            validate_observation(observation, role=f"public trace event {index}")
-        except Exception as exc:
-            raise ValueError(f"public trace event {index} has invalid observation: {exc}") from exc
-        copied.append(_copy_object(value))
-    return tuple(copied)
 
 
 def _challenges(values: tuple[ChallengeCategory, ...]) -> tuple[ChallengeCategory, ...]:

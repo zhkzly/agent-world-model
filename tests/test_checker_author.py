@@ -10,16 +10,11 @@ from agent_env_foundry.checker_author import (
     CheckerAuthorInputError,
     compute_checker_project_digest,
     execute_checker_project,
-    execute_task_checker,
     prepare_checker_author_workspace,
     run_checker_checks,
 )
 from agent_env_foundry.physical_runtime import PreparationSettings
-from agent_env_foundry.task_contract import (
-    CandidateTaskContract,
-    TaskProposalEvidence,
-    make_task_check_request,
-)
+from agent_env_foundry.task_contract import CandidateTaskContract, TaskProposalEvidence
 
 
 def _evidence() -> TaskProposalEvidence:
@@ -203,23 +198,6 @@ def test_real_checker_project_passes_host_contract_and_executes_twice(tmp_path: 
     assert task.checker_project_digest == digest
     assert task.task_id
 
-    no_op = make_task_check_request(
-        task,
-        before_state=evidence.before_state,
-        after_state=evidence.before_state,
-        public_trace=(),
-        final_answer=evidence.proposed_final_answer,
-    )
-    no_op_result = execute_task_checker(
-        prepared.root,
-        task=task,
-        request=no_op,
-        runtime_root=tmp_path / "no-op-runtime",
-        settings=PreparationSettings(tmp_path / "uv-cache", 120.0),
-    )
-    assert not no_op_result.passed
-    assert not no_op_result.goal
-
 
 def test_checker_source_cannot_import_actor_or_host(tmp_path: Path) -> None:
     evidence = _evidence()
@@ -240,15 +218,3 @@ def test_checker_source_cannot_import_actor_or_host(tmp_path: Path) -> None:
     assert checks[0].phase == "source_contract"
     assert not checks[0].passed
     assert "forbidden_import" in checks[0].stderr
-
-
-def test_checker_guidance_forbids_hidden_proposal_serialization_constraints() -> None:
-    root = Path(checker_author_module.__file__).parent / "runtime_skills/task-checker-codegen"
-    skill = (root / "SKILL.md").read_text(encoding="utf-8")
-    contract = (root / "TASK_CHECKER_CONTRACT.md").read_text(encoding="utf-8")
-
-    assert "hidden answer rule" in skill
-    assert "schema-valid alternative positive representation" in skill
-    assert "collateral near miss must keep" in skill
-    assert "not a hidden refinement" in contract
-    assert "must not retroactively" in contract

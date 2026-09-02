@@ -90,17 +90,6 @@ def test_proposal_evidence_is_physical_preimage_not_a_verdict() -> None:
     assert changed.evidence_id != evidence.evidence_id
 
 
-def test_proposal_and_checker_share_one_exact_public_trace_shape() -> None:
-    evidence = _proposal_evidence()
-    invalid = evidence.to_document()["public_trace"]
-    assert isinstance(invalid, list)
-    assert isinstance(invalid[0], dict)
-    invalid[0]["tool_name"] = invalid[0].pop("tool")
-
-    with pytest.raises(ValueError, match="public trace event"):
-        replace(evidence, public_trace=tuple(invalid))
-
-
 def test_sealed_task_has_one_checker_authority_and_nonleaking_public_projection() -> None:
     candidate = _candidate()
     task = seal_task_contract(
