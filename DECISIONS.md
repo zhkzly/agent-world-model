@@ -242,3 +242,12 @@ Checkpoint B adds one task-neutral state reader in the actor project, one
 stdlib child and one Host proxy. The first real boundary caught and repaired a
 schema lie that business assertions would otherwise miss; no Release or Task
 path was switched.
+
+`s1-s2-realignment-cp-c|介入0|返工1|internal v3 conformance+ZIP/cold relocation+shared physical runtime+5 mutation licences+537 full tests|红线违反0`
+
+Checkpoint C adds one unexported environment-only S1 vertical and leaves the
+sole public v2 API unchanged until atomic cutover. A pre-commit code-volume
+audit rejected a copied 735-line preparation implementation; task-neutral uv,
+child transport, Actor proxy and protected snapshot behavior now exist once in
+`physical_runtime.py`, while an isolated-process import test proves the v3
+coordinator loads no old semantics, Qualification, Verifier or Task module.

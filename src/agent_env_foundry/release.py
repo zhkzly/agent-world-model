@@ -27,7 +27,6 @@ from agent_env_foundry.schema import (
     require_object_root,
     validate_schema_document,
 )
-from agent_env_foundry.semantics import CapabilitySpec, StartCase
 
 if TYPE_CHECKING:
     from agent_env_foundry.preparation import PreparedReleaseIdentity
@@ -39,6 +38,7 @@ if TYPE_CHECKING:
         QualifiedStartCasesManifest,
         RequirementCoverageManifest,
     )
+    from agent_env_foundry.semantics import CapabilitySpec, StartCase
 
 __all__ = [
     "DESCRIPTOR_FORMAT_V2",
@@ -708,9 +708,24 @@ def write_release_zip_v2(release_root: Path, destination: Path) -> Path:
     """Write one deterministic ZIP from an already admitted release directory."""
 
     release = verify_release_v2(release_root)
+    return _write_verified_release_zip(
+        release.root,
+        destination,
+        role="v2 release ZIP",
+    )
+
+
+def _write_verified_release_zip(
+    release_root: Path,
+    destination: Path,
+    *,
+    role: str,
+) -> Path:
+    """Write exact already-verified release bytes without choosing admission."""
+
     output = Path(destination)
     if output.exists() or output.is_symlink():
-        raise EnvironmentContractError("v2 release ZIP destination must be new")
+        raise EnvironmentContractError(f"{role} destination must be new")
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
         with zipfile.ZipFile(
@@ -720,10 +735,10 @@ def write_release_zip_v2(release_root: Path, destination: Path) -> Path:
             compresslevel=9,
         ) as archive:
             for path in sorted(
-                release.root.rglob("*"),
-                key=lambda item: item.relative_to(release.root).as_posix(),
+                release_root.rglob("*"),
+                key=lambda item: item.relative_to(release_root).as_posix(),
             ):
-                relative = path.relative_to(release.root).as_posix()
+                relative = path.relative_to(release_root).as_posix()
                 if path.is_dir():
                     info = zipfile.ZipInfo(
                         f"{relative}/",
@@ -755,6 +770,19 @@ def _publication_records(
     *,
     excluded: set[PurePosixPath],
 ) -> tuple[PayloadRecord, ...]:
+    return _publication_records_for_roots(
+        root,
+        excluded=excluded,
+        allowed_roots=_V2_PAYLOAD_ROOTS,
+    )
+
+
+def _publication_records_for_roots(
+    root: Path,
+    *,
+    excluded: set[PurePosixPath],
+    allowed_roots: frozenset[str],
+) -> tuple[PayloadRecord, ...]:
     records: list[PayloadRecord] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
         relative = PurePosixPath(path.relative_to(root).as_posix())
@@ -764,7 +792,7 @@ def _publication_records(
             raise EnvironmentContractError(f"publication member {relative} is a symlink")
         if not path.is_file():
             continue
-        if not relative.parts or relative.parts[0] not in _V2_PAYLOAD_ROOTS:
+        if not relative.parts or relative.parts[0] not in allowed_roots:
             raise EnvironmentContractError(
                 f"publication member {relative} lies outside the closed layout"
             )

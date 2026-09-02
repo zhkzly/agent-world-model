@@ -81,30 +81,33 @@ tests/test_environment_contract.py
 tests/test_state_snapshot.py
 ```
 
-## 4. Checkpoint C — Atomic EnvironmentRelease/3 and S1 cutover
+## 4. Checkpoint C — Complete internal EnvironmentRelease/3 S1 vertical
 
 ### Work
 
-1. Implement v3 descriptor, publication, verification, ZIP and cold reader.
-2. Replace `prepare_release` with actor + protected snapshot materialization.
-3. Replace `generate_environment_v2` with the sole v3 S1 order:
+1. Implement internal v3 publication, verification, ZIP and cold reader behind
+   non-exported module boundaries.
+2. Implement internal actor + protected snapshot preparation without exposing a
+   second public release reader.
+3. Implement the internal v3 S1 order:
 
    ```text
    Need -> Research -> Builder -> public/state surface
         -> environment conformance -> publication -> ZIP -> cold prepare
    ```
 
-4. Atomically remove S1 Expected Semantics, TaskSemantics Author, Native
-   Auditor and task-case Qualification calls from the public path.
-5. Delete old v2 reader/conversion/fixture authority in the same cutover.
+4. Prove the internal path contains no Expected Semantics, TaskSemantics Author,
+   Native Auditor or task-case Qualification dependency.
+5. Leave the sole exported v2 API untouched until v3 S2 is ready for the final
+   atomic cutover; do not add a public flag, adapter or reader.
 
 ### Exit
 
-- A failed Task concept cannot block or revoke S1 publication.
-- v2 packages fail as unsupported; no dual reader exists.
-- Cold v3 Release opens from a relocated directory with public/protected
+- A failed Task concept cannot block the internal v3 publication path.
+- Only the old API is exported; no dual public reader exists.
+- An internal cold v3 Release opens from a relocated directory with public/protected
   separation.
-- Old S1 semantic-authority production references are zero.
+- The internal v3 path has zero old S1 semantic-authority references.
 
 ### Expected files
 
@@ -139,7 +142,7 @@ tests/v3_release_factory.py
 
 ### Rollback point
 
-Commit the complete S1 v3 boundary before beginning S2 work. If this checkpoint
+Commit the complete internal S1 v3 boundary before beginning S2 work. If this checkpoint
 fails, fix S1 or revise the approved design; do not start S2 scaffolding.
 
 ## 6. Checkpoint E — S2 CandidateTaskContract and checker authority
@@ -195,17 +198,19 @@ tests/test_task_foundry.py
 - Alternative valid execution is not rejected for trace inequality.
 - Existing public Agent and assessment code is reused, not forked.
 
-## 8. Checkpoint G — Deletion closure and held-out proof
+## 8. Checkpoint G — Atomic public cutover, deletion closure and held-out proof
 
 ### Work
 
-1. Delete obsolete S1/S2 semantic-authority modules, runtime Skills, fixtures,
+1. Atomically replace the exported release/preparation/generation/S2 API with
+   the proven v3 path; old v2 bytes become unsupported in that same commit.
+2. Delete obsolete S1/S2 semantic-authority modules, runtime Skills, fixtures,
    tests and docs after their last consumer moves.
-2. Grep for old semantics/verifier factories, v2 roots, `TrustedProxy`, sealed
+3. Grep for old semantics/verifier factories, v2 roots, `TrustedProxy`, sealed
    capability/start/task-goal fields and compatibility language.
-3. Run a post-freeze held-out Need through S1 v3 and S2 Direct with no domain
+4. Run a post-freeze held-out Need through S1 v3 and S2 Direct with no domain
    edits.
-4. Run independent cross-layer/semantic review and publish exact LOC/deletion
+5. Run independent cross-layer/semantic review and publish exact LOC/deletion
    evidence.
 
 ### Exit

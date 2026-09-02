@@ -8,6 +8,7 @@ from unittest import mock
 
 import pytest
 
+import agent_env_foundry.physical_runtime as physical_runtime_module
 import agent_env_foundry.preparation as preparation_module
 from agent_env_foundry.errors import EnvironmentContractError
 from agent_env_foundry.preparation import (
@@ -231,7 +232,7 @@ def test_materializer_attributes_copy_time_identity_failure_and_cleans_staging(
             path="src/release.py",
         )
 
-    monkeypatch.setattr(preparation_module, "copy_authored_project", changed_during_copy)
+    monkeypatch.setattr(physical_runtime_module, "copy_authored_project", changed_during_copy)
     runtime = tmp_path / "runtime"
     with pytest.raises(PreparationExecutionError) as caught:
         materialize_project(
