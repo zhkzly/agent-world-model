@@ -246,6 +246,64 @@ def test_builder_uses_official_sdk_shape_and_same_thread_factual_repair(
     assert result.checks[-1].exit_code == 0
 
 
+def test_semantic_acceptance_returns_all_findings_to_same_builder_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeCodex.instances.clear()
+    monkeypatch.setattr(builder_module, "Codex", FakeCodex)
+    monkeypatch.setattr(
+        builder_module,
+        "run_candidate_checks",
+        lambda root, config: (CommandResult("build", ("uv", "build"), 0, "", ""),),
+    )
+    reviews = 0
+    accepted = {"format": "environment-semantic-qualification/1", "verdict": "passed"}
+
+    def acceptance(candidate: object) -> CommandResult:
+        nonlocal reviews
+        reviews += 1
+        if reviews == 1:
+            return CommandResult(
+                "semantic_qualification",
+                ("host", "review-need-semantics"),
+                1,
+                "",
+                json.dumps(
+                    {
+                        "code": "need_semantics_not_satisfied",
+                        "findings": [
+                            {"requirement_id": "REQ-001", "reason": "transition wrong"},
+                            {"requirement_id": "REQ-002", "reason": "refusal unproved"},
+                        ],
+                    }
+                ),
+            )
+        return CommandResult(
+            "semantic_qualification",
+            ("host", "review-need-semantics"),
+            0,
+            json.dumps(accepted),
+            "",
+        )
+
+    result = run_builder(
+        projection(),
+        tmp_path / "candidate",
+        config=BuilderConfig(max_turns=2, uv_cache_dir=tmp_path / "uv-cache"),
+        acceptance_check=acceptance,
+    )
+
+    sdk = FakeCodex.instances[-1]
+    assert sdk.thread is not None and len(sdk.thread.prompts) == 2
+    assert "REQ-001" in sdk.thread.prompts[1]
+    assert "REQ-002" in sdk.thread.prompts[1]
+    assert "transition wrong" in sdk.thread.prompts[1]
+    assert "refusal unproved" in sdk.thread.prompts[1]
+    assert [item.phase for item in result.checks] == ["build", "semantic_qualification"]
+    assert result.acceptance == accepted
+
+
 def test_unchanged_failed_candidate_is_typed_stall(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

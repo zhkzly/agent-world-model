@@ -143,6 +143,37 @@ S1 does not claim that every imagined downstream Task is valid. It claims that
 the released executable world and its declared interfaces satisfy the frozen
 Development Brief and physical conformance evidence.
 
+### 4.4 Independent Need-semantic qualification
+
+The claim in the preceding paragraph requires a separate post-build semantic
+review. Builder-authored tests and diagnostic expectations are inputs to
+physical execution, never semantic authority.
+
+```text
+frozen BuilderProjection requirements
++ public ToolSpecs
++ Host-executed diagnostic reset/step evidence
++ protected before/after state
+-> fresh evidence reviewer
+-> one cited finding per Requirement
+-> Framework-derived pass/fail
+```
+
+The reviewer sees no Builder source, test assertions, expected_ok/state_effect
+declarations, Task/checker/witness data, release verdict or prior conversation.
+It may cite only Host-assigned evidence references. Tool descriptions and
+`ok=true` are not proof; missing evidence and unverifiable relations fail.
+
+Its output contains only `requirement_id`, `verdict`, `evidence_refs` and
+`reason`. Framework owns exact-ID coverage, reference validity, digests and the
+aggregate verdict. One same-session correction is allowed only for malformed
+output. Semantic failures are returned together to the still-open Builder
+session; the reviewer never edits code or relaxes requirements.
+
+The historical 20 EnvironmentRelease/3 artifacts remain immutable as the
+physical-conformance-only comparison cohort. Newly qualified releases use new
+identities and a new experiment root; no old artifact is rewritten.
+
 ## 5. Prepared release/session boundary
 
 `prepare_release` materializes one actor runtime, not actor + semantics.
@@ -286,4 +317,3 @@ At each checkpoint, review against:
 - no Task/checker/reward bytes in S1 Release;
 - no protected state in public policy input;
 - no peer reader or witness result defining Task truth.
-

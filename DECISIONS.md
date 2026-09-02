@@ -308,3 +308,11 @@ descriptor, publisher or compatibility switch; actor/checker are the only
 authored project roles.
 
 `s2-sampling-measurement|介入0|返工0|stage latency+turn/tool/token evidence+mutation licence|红线违反0`
+
+`s1-semantic-qualification|介入1|返工1|SQLite+Git+Clinic real Releases+4 semantic mutants+5 mutation licences+full suite|红线违反0`
+
+The fresh reviewer consumes only frozen Requirement groups, public ToolSpecs
+and a Host-derived evidence projection. Full evidence remains release-bound;
+the model view deduplicates initial snapshots and represents all state changes
+as complete JSON leaf diffs plus exact reopen/reset equality. No domain branch,
+Builder self-verdict, Task, answer or reward enters S1 acceptance.

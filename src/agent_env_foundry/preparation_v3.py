@@ -12,6 +12,7 @@ from types import TracebackType
 from typing import Self
 
 from agent_env_foundry.environment import JSONValue
+from agent_env_foundry.environment_semantic_qualification import SemanticQualification
 from agent_env_foundry.physical_runtime import (
     ActorProxy as ActorProxyV3,
 )
@@ -39,6 +40,7 @@ from agent_env_foundry.physical_runtime import (
 from agent_env_foundry.release import canonical_bytes, safe_member_path, sha256_hex
 from agent_env_foundry.release_v3 import ValidatedReleaseV3, verify_release_v3_internal
 from agent_env_foundry.release_v3_contract import DESCRIPTOR_FORMAT_V3
+from agent_env_foundry.research import BuilderProjection
 
 _FORBIDDEN_ACTOR_MODULES = ("agent_env_foundry",)
 
@@ -49,11 +51,17 @@ class PreparedReleaseIdentityV3:
     release_id: str
     actor_digest: str
     state_schema_digest: str
+    builder_projection_digest: str
 
     def __post_init__(self) -> None:
         if self.format != DESCRIPTOR_FORMAT_V3:
             raise PreparationContractErrorV3("prepared format must be environment-release/3")
-        for name in ("release_id", "actor_digest", "state_schema_digest"):
+        for name in (
+            "release_id",
+            "actor_digest",
+            "state_schema_digest",
+            "builder_projection_digest",
+        ):
             value = getattr(self, name)
             if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
                 raise PreparationContractErrorV3(f"prepared {name} must be a sha256 digest")
@@ -102,6 +110,7 @@ class OpenPreparedReleaseV3:
             release.release_id,
             release.descriptor.actor_project_digest,
             release.receipt.state_schema_digest,
+            release.semantic_evidence.qualification.builder_projection_digest,
         )
         self._release = release
         self._actor = actor
@@ -111,6 +120,14 @@ class OpenPreparedReleaseV3:
     @property
     def state_events(self) -> tuple[StateSnapshotEventV3, ...]:
         return tuple(self._state_events)
+
+    @property
+    def builder_projection(self) -> BuilderProjection:
+        return self._release.semantic_evidence.projection
+
+    @property
+    def semantic_qualification(self) -> SemanticQualification:
+        return self._release.semantic_evidence.qualification
 
     def open(self, instance_directory: Path) -> OpenPreparedSessionV3:
         _verify_runtime(self._actor, self._settings.command_timeout_seconds)

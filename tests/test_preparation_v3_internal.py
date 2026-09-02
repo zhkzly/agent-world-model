@@ -40,11 +40,18 @@ def test_internal_v3_directory_zip_relocation_and_protected_state(tmp_path: Path
         settings=_settings(),
     )
     assert directory.identity == zipped.identity
+    assert zipped.semantic_qualification.passed
+    assert (
+        zipped.identity.builder_projection_digest
+        == zipped.semantic_qualification.builder_projection_digest
+    )
+    assert zipped.builder_projection.to_document()["requirements"][0]["id"] == "REQ-001"
 
     instance = tmp_path / "instance"
     with zipped.open(instance) as session:
         assert not hasattr(session, "trusted")
         assert not hasattr(session.actor, "read_state")
+        assert not hasattr(session.actor, "builder_projection")
         assert session.actor.reset({"seed": 2}) == {"count": 2}
         assert session.actor.invoke("increment", {"amount": 3}) == {
             "ok": True,

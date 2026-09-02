@@ -8,21 +8,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_env_foundry.agents import AgentRoute, run_research
-from agent_env_foundry.builder import BuilderConfig, run_builder
+from agent_env_foundry.builder import BuilderConfig, CandidateBuild, CommandResult, run_builder
 from agent_env_foundry.environment import JSONObject
 from agent_env_foundry.environment_conformance_v3 import (
+    ConformedEnvironmentV3,
+    bind_environment_semantics_v3,
     run_environment_conformance_v3_internal,
+)
+from agent_env_foundry.environment_semantic_qualification import (
+    SemanticQualificationFailure,
+    review_environment_semantics,
+    semantic_qualification_from_document,
 )
 from agent_env_foundry.preparation_v3 import (
     OpenPreparedReleaseV3,
     PreparationSettingsV3,
     prepare_release_v3_internal,
 )
+from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.release_v3 import (
     publish_release_v3_internal,
     write_release_zip_v3_internal,
 )
 from agent_env_foundry.research import (
+    BuilderProjection,
     EvidenceStore,
     NeedRecord,
     NotReleased,
@@ -36,6 +45,7 @@ from agent_env_foundry.research import (
 _OWNER = {
     "research": "Research",
     "environment_builder": "EnvironmentBuilder",
+    "environment_semantic_qualification": "EnvironmentSemanticQualification",
     "environment_conformance": "EnvironmentConformance",
     "publication": "Publication",
     "write_zip": "Publication",
@@ -130,9 +140,15 @@ def generate_environment_v3_internal(
                 research.builder_projection,
                 work / "actor",
                 config=config.builder,
+                acceptance_check=lambda candidate: _semantic_acceptance_check(
+                    candidate,
+                    projection=research.builder_projection,
+                    runtime_root=work / "semantic-qualification-runtime",
+                    config=config,
+                ),
             ),
         )
-        conformed = _run_stage(
+        physical = _run_stage(
             "environment_conformance",
             events,
             event_sink,
@@ -140,6 +156,16 @@ def generate_environment_v3_internal(
                 actor,
                 work / "conformance-runtime",
                 settings=config.preparation,
+            ),
+        )
+        conformed = _run_stage(
+            "environment_semantic_qualification",
+            events,
+            event_sink,
+            lambda: _bind_accepted_semantics(
+                actor,
+                physical,
+                projection=research.builder_projection,
             ),
         )
         release = _run_stage(
@@ -188,6 +214,83 @@ def generate_environment_v3_internal(
     )
 
 
+def _semantic_acceptance_check(
+    candidate: CandidateBuild,
+    *,
+    projection: BuilderProjection,
+    runtime_root: Path,
+    config: GenerationConfigV3,
+) -> CommandResult:
+    physical = run_environment_conformance_v3_internal(
+        candidate,
+        runtime_root / candidate.candidate_digest,
+        settings=config.preparation,
+    )
+    qualification = review_environment_semantics(
+        projection,
+        actor_project_digest=candidate.candidate_digest,
+        tool_specs=physical.tool_specs,
+        diagnostic_evidence=physical.diagnostic_evidence,
+        route=config.route,
+    )
+    if qualification.passed:
+        return CommandResult(
+            "semantic_qualification",
+            ("host", "review-need-semantics"),
+            0,
+            canonical_bytes(qualification.to_document()).decode("utf-8"),
+            "",
+        )
+    return CommandResult(
+        "semantic_qualification",
+        ("host", "review-need-semantics"),
+        1,
+        "",
+        canonical_bytes(
+            {
+                "code": "need_semantics_not_satisfied",
+                "message": (
+                    "Independent review found that actual Host evidence does not satisfy "
+                    "every frozen Requirement. Repair code and/or diagnostic coverage; do not "
+                    "edit the frozen projection."
+                ),
+                "findings": [
+                    item.to_document()
+                    for item in qualification.findings
+                    if item.verdict == "not_satisfied"
+                ],
+            }
+        ).decode("utf-8"),
+    )
+
+
+def _bind_accepted_semantics(
+    candidate: CandidateBuild,
+    physical: ConformedEnvironmentV3,
+    *,
+    projection: BuilderProjection,
+) -> ConformedEnvironmentV3:
+    if candidate.acceptance is None:
+        raise SemanticQualificationFailure(
+            "QualifierDefect",
+            "semantic_qualification_missing",
+            "Builder completed without an accepted semantic qualification",
+        )
+    try:
+        qualification = semantic_qualification_from_document(candidate.acceptance)
+        return bind_environment_semantics_v3(
+            physical,
+            projection=projection,
+            qualification=qualification,
+        )
+    except ValueError as exc:
+        raise SemanticQualificationFailure(
+            "QualifierDefect",
+            "semantic_qualification_binding_invalid",
+            str(exc),
+        ) from exc
+
+
 def _run_stage[T](
     stage: str,
     events: list[JSONObject],
@@ -224,7 +327,11 @@ def _terminal_failure(stage: str, exc: Exception, events: list[JSONObject]) -> N
     details = dict(raw_details) if isinstance(raw_details, dict) else {"details": raw_details}
     details.update(
         {
-            "owner": _OWNER[stage],
+            "owner": (
+                "EnvironmentSemanticQualification"
+                if isinstance(exc, SemanticQualificationFailure)
+                else _OWNER[stage]
+            ),
             "original_type": type(exc).__name__,
             "events": list(events),
         }

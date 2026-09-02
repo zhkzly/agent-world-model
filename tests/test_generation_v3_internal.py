@@ -8,11 +8,19 @@ from typing import Any
 
 import pytest
 
+from agent_env_foundry.environment_semantic_qualification import SemanticQualificationFailure
 from agent_env_foundry.preparation_v3 import PreparationExecutionErrorV3
+from agent_env_foundry.research import BuilderProjection
 
 
 class _ResearchReady:
-    builder_projection = object()
+    builder_projection = BuilderProjection(
+        frozen_need={"original_need": "test", "clauses": []},
+        selected_world={"scope": "test"},
+        requirements=({"id": "REQ-001"},),
+        initial_world_relations=(),
+        cited_evidence=(),
+    )
     digest = "1" * 64
 
     def write(self, path: Path) -> None:
@@ -37,7 +45,11 @@ def _install_success(monkeypatch: pytest.MonkeyPatch) -> tuple[object, list[str]
 
         return run
 
-    actor = SimpleNamespace(workspace=Path("actor"), candidate_digest="2" * 64)
+    actor = SimpleNamespace(
+        workspace=Path("actor"),
+        candidate_digest="2" * 64,
+        acceptance={"verdict": "passed"},
+    )
     conformed = SimpleNamespace(
         receipt=object(),
         evidence={},
@@ -50,11 +62,22 @@ def _install_success(monkeypatch: pytest.MonkeyPatch) -> tuple[object, list[str]
     monkeypatch.setattr(subject, "ResearchReady", _ResearchReady)
     monkeypatch.setattr(subject, "ResearchTools", lambda **kwargs: _Tools())
     monkeypatch.setattr(subject, "run_research", stage("research", _ResearchReady()))
-    monkeypatch.setattr(subject, "run_builder", stage("environment_builder", actor))
+
+    def build(*args: Any, **kwargs: Any) -> Any:
+        calls.append("environment_builder")
+        assert callable(kwargs["acceptance_check"])
+        return actor
+
+    monkeypatch.setattr(subject, "run_builder", build)
     monkeypatch.setattr(
         subject,
         "run_environment_conformance_v3_internal",
         stage("environment_conformance", conformed),
+    )
+    monkeypatch.setattr(
+        subject,
+        "_bind_accepted_semantics",
+        stage("environment_semantic_qualification", conformed),
     )
     monkeypatch.setattr(
         subject,
@@ -94,6 +117,7 @@ def test_internal_v3_generation_has_only_environment_stages(
         "research",
         "environment_builder",
         "environment_conformance",
+        "environment_semantic_qualification",
         "publication",
         "write_zip",
         "cold_prepare",
@@ -137,6 +161,43 @@ def test_internal_v3_conformance_failure_stops_before_publication(
     assert result.details["owner"] == "EnvironmentConformance"
 
 
+def test_semantic_reviewer_failure_is_not_attributed_to_builder(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_env_foundry.generation_v3 as subject
+
+    monkeypatch.setattr(subject, "ResearchReady", _ResearchReady)
+    monkeypatch.setattr(subject, "ResearchTools", lambda **kwargs: _Tools())
+    monkeypatch.setattr(subject, "run_research", lambda **kwargs: _ResearchReady())
+    monkeypatch.setattr(
+        subject,
+        "run_builder",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            SemanticQualificationFailure(
+                "InfrastructureFailure",
+                "semantic_review_provider_failed",
+                "review provider failed",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        subject,
+        "publish_release_v3_internal",
+        lambda *args, **kwargs: pytest.fail("publication must not run"),
+    )
+
+    result = subject.generate_environment_v3_internal(
+        "Build a resettable environment.",
+        tmp_path / "work",
+        tmp_path / "output",
+        config=subject.GenerationConfigV3(),
+    )
+
+    assert result.code == "semantic_review_provider_failed"
+    assert result.details["owner"] == "EnvironmentSemanticQualification"
+
+
 def test_internal_v3_generation_imports_no_task_authority() -> None:
     import agent_env_foundry.generation_v3 as subject
 
@@ -161,8 +222,10 @@ def test_internal_v3_import_graph_does_not_load_task_authority() -> None:
             "-c",
             "import sys,agent_env_foundry.generation_v3;"
             "print('\\n'.join(sorted(n for n in sys.modules "
-            "if n.startswith('agent_env_foundry') and any(t in n for t in "
-            "('semantics','qualification','verifier','task_foundry')))))",
+            "if n in ('agent_env_foundry.semantics_author',"
+            "'agent_env_foundry.qualification_v2',"
+            "'agent_env_foundry.verifier_author',"
+            "'agent_env_foundry.task_foundry'))))",
         ),
         check=False,
         capture_output=True,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +97,21 @@ def test_current_release_support_exports_no_v2_product_api() -> None:
         "write_release_zip_v2",
     ):
         assert obsolete not in release
+
+
+def test_environment_semantic_qualification_contains_no_domain_branch() -> None:
+    source = "\n".join(
+        _text(ROOT / relative)
+        for relative in (
+            "src/agent_env_foundry/environment_semantic_qualification.py",
+            "src/agent_env_foundry/environment_conformance_v3.py",
+        )
+    )
+    forbidden = re.compile(
+        r"\b(?:library|book|patron|loan|booking|hotel|sqlite|changelog|warehouse|clinic)\b",
+        re.IGNORECASE,
+    )
+    assert forbidden.search(source) is None
 
 
 def test_current_product_authority_separates_s1_environment_from_s2_task_truth() -> None:

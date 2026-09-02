@@ -58,6 +58,7 @@ def test_v3_conformance_issues_host_receipt_from_physical_actor(tmp_path: Path) 
     assert host["reopen_persistence"] is True
     assert host["controlled_reset_replay"] is True
     assert host["instance_isolation"] is True
+    assert host["public_tool_specs"] == [dict(item) for item in conformed.tool_specs]
     assert host["diagnostic_results"] == [
         {
             "scenario_id": "increment-and-refuse",
@@ -65,6 +66,25 @@ def test_v3_conformance_issues_host_receipt_from_physical_actor(tmp_path: Path) 
             "trace_digest": host["diagnostic_results"][0]["trace_digest"],
         }
     ]
+    assert list(conformed.diagnostic_evidence) == host["diagnostic_evidence"]
+    scenario = conformed.diagnostic_evidence[0]
+    assert scenario["reset"]["evidence_ref"] == "increment-and-refuse:reset"
+    assert [item["evidence_ref"] for item in scenario["steps"]] == [
+        "increment-and-refuse:step:0",
+        "increment-and-refuse:step:1",
+    ]
+    assert scenario["steps"][0]["state_after_reopen"] == {"count": 1}
+    assert [item["evidence_ref"] for item in scenario["lifecycle"]] == [
+        "increment-and-refuse:reopen",
+        "increment-and-refuse:reset-after-actions",
+    ]
+    assert scenario["lifecycle"][0]["before_state"] == {"count": 1}
+    assert scenario["lifecycle"][0]["after_state"] == {"count": 1}
+    assert scenario["lifecycle"][1]["after_state"] == {"count": 0}
+    reviewer_evidence = json.dumps(conformed.diagnostic_evidence)
+    assert "expected_ok" not in reviewer_evidence
+    assert "state_effect" not in reviewer_evidence
+    assert "expected_error_code" not in reviewer_evidence
 
 
 def test_v3_conformance_rejects_incomplete_builder_evidence(tmp_path: Path) -> None:
@@ -171,3 +191,44 @@ def test_v3_diagnostic_runner_rejects_instance_derived_replay_state(tmp_path: Pa
         )
 
     assert caught.value.code == "diagnostic_replay_drift"
+
+
+def test_v3_diagnostic_runner_rejects_reset_that_keeps_prior_mutation(
+    tmp_path: Path,
+) -> None:
+    actor = build_actor_project(tmp_path / "actor")
+    source_path = actor / "src/generated_environment/release.py"
+    source = source_path.read_text(encoding="utf-8")
+    source_path.write_text(
+        source.replace(
+            'state = {"count": int((start or {}).get("seed", 0))}\n'
+            "        self._write(state)\n"
+            "        return dict(state)",
+            "if self.state_path.exists():\n"
+            "            return self._read()\n"
+            '        state = {"count": int((start or {}).get("seed", 0))}\n'
+            "        self._write(state)\n"
+            "        return dict(state)",
+        ),
+        encoding="utf-8",
+    )
+    digest = compute_authored_project_digest(actor, "actor", require_locked_project=True)
+    phases = (
+        "lock",
+        "sync",
+        "build",
+        "tests",
+        "public_contract",
+        "source_determinism",
+        "live_contract",
+    )
+    checks = tuple(CommandResult(phase, ("physical", phase), 0, "passed", "") for phase in phases)
+
+    with pytest.raises(PreparationExecutionErrorV3) as caught:
+        run_environment_conformance_v3_internal(
+            CandidateBuild(actor, "fixture-thread", digest, "fixture", checks),
+            tmp_path / "runtime",
+            settings=_settings(),
+        )
+
+    assert caught.value.code == "diagnostic_reset_restoration"

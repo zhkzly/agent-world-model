@@ -9,3 +9,7 @@
 - [ ] YES/NO: Are old readers, adapters, flags and compatibility paths absent rather than deprecated?
 - [ ] YES/NO: Do filesystem/Git, SQLite and held-out physical runs use the same production path?
 - [ ] YES/NO: Is every checkpoint backed by RED/GREEN, mutation evidence, full checks and an honest LOC/deletion report?
+- [ ] YES/NO: Does every frozen S1 Requirement receive exactly one fresh cited semantic finding before publication?
+- [ ] YES/NO: Is the semantic reviewer blind to Builder source, tests, self-declared expectations, Tasks and release verdict?
+- [ ] YES/NO: Do missing evidence, wrong transitions and wrong refusal semantics fail without a domain-specific Framework branch?
+- [ ] YES/NO: Are the original 20 physical-only Release artifacts preserved byte-for-byte as a comparison cohort?

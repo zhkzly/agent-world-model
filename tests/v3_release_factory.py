@@ -5,9 +5,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import agent_env_foundry.environment_semantic_qualification as qualification_module
 from agent_env_foundry.conformance_v3 import make_conformance_receipt
+from agent_env_foundry.environment_semantic_qualification import (
+    SEMANTIC_QUALIFICATION_FORMAT,
+    SemanticFinding,
+    SemanticQualification,
+    make_qualified_conformance_evidence,
+)
 from agent_env_foundry.project_identity import compute_authored_project_digest
+from agent_env_foundry.release import canonical_bytes, sha256_hex
 from agent_env_foundry.release_v3 import ValidatedReleaseV3, publish_release_v3_internal
+from agent_env_foundry.research import BuilderProjection
 
 
 def _write(path: Path, text: str) -> None:
@@ -128,10 +137,104 @@ def build_v3_release(
     actor = build_actor_project(root / "actor-project")
     actor_digest = compute_authored_project_digest(actor, "actor", require_locked_project=True)
     start, reset, state = v3_schemas()
-    evidence = {
+    tools = receipt_tools or v3_tools()
+    tool_name = tools[0]["name"]
+    diagnostic_evidence = (
+        {
+            "scenario_id": "fixture",
+            "reset": {
+                "evidence_ref": "fixture:reset",
+                "reset_observation": {"count": 0},
+                "initial_state": {"count": 0},
+            },
+            "steps": [
+                {
+                    "evidence_ref": "fixture:step:0",
+                    "tool": tool_name,
+                    "arguments": {"amount": 1},
+                    "observation": {"ok": True, "data": {"count": 1}, "error": None},
+                    "before_state": {"count": 0},
+                    "after_state": {"count": 1},
+                },
+                {
+                    "evidence_ref": "fixture:step:1",
+                    "tool": tool_name,
+                    "arguments": {"amount": 99},
+                    "observation": {
+                        "ok": False,
+                        "data": None,
+                        "error": {"code": "amount_too_large", "message": "too large"},
+                    },
+                    "before_state": {"count": 1},
+                    "after_state": {"count": 1},
+                },
+            ],
+            "final_state": {"count": 1},
+        },
+    )
+    projection = BuilderProjection(
+        frozen_need={"original_need": "Increment a persistent counter.", "clauses": []},
+        selected_world={"scope": "counter"},
+        requirements=(
+            {
+                "id": "REQ-001",
+                "kind": "workflows",
+                "state_relation": "A valid increment changes persistent count.",
+                "observable_relation": "The new count is returned.",
+                "falsifiable_consequence": "Count does not change.",
+            },
+            {
+                "id": "REQ-002",
+                "kind": "refusals",
+                "state_relation": "An excessive increment is refused without mutation.",
+                "observable_relation": "A stable error code is returned.",
+                "falsifiable_consequence": "The refusal changes count.",
+            },
+        ),
+        initial_world_relations=(),
+        cited_evidence=(),
+    )
+    normalized_tools = qualification_module._normalized_tools(tools)
+    review_inputs = [
+        qualification_module._review_input(
+            projection,
+            normalized_tools,
+            diagnostic_evidence,
+            requirement_ids=group,
+        )
+        for group in qualification_module._requirement_groups(projection)
+    ]
+    qualification = SemanticQualification(
+        SEMANTIC_QUALIFICATION_FORMAT,
+        actor_digest,
+        sha256_hex(canonical_bytes(projection.to_document())),
+        sha256_hex(canonical_bytes(review_inputs)),
+        sha256_hex(canonical_bytes(list(diagnostic_evidence))),
+        "fixture-reviewer",
+        sha256_hex(qualification_module._PROMPT.encode("utf-8")),
+        2,
+        (None, None),
+        (
+            SemanticFinding("REQ-001", "satisfied", ("fixture:step:0",), "observed"),
+            SemanticFinding("REQ-002", "satisfied", ("fixture:step:1",), "observed"),
+        ),
+    )
+    physical_evidence = {
         "format": "environment-conformance-evidence/3",
-        "checks": ["fixture-project", "physical-runtime"],
+        "actor_project_digest": actor_digest,
+        "builder_checks": [],
+        "host_checks": {
+            "public_tool_specs": [dict(item) for item in normalized_tools],
+            "diagnostic_evidence": list(diagnostic_evidence),
+        },
     }
+    evidence = make_qualified_conformance_evidence(
+        physical_evidence,
+        projection=projection,
+        tool_specs=normalized_tools,
+        diagnostic_evidence=diagnostic_evidence,
+        qualification=qualification,
+    )
     receipt = make_conformance_receipt(
         actor_project_digest=actor_digest,
         actor_factory="generated_environment.release:make_environment",
@@ -139,7 +242,7 @@ def build_v3_release(
         start_schema=start,
         reset_observation_schema=reset,
         state_schema=state,
-        tool_specs=receipt_tools or v3_tools(),
+        tool_specs=normalized_tools,
         evidence=evidence,
     )
     return publish_release_v3_internal(

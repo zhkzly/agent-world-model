@@ -124,6 +124,26 @@ tests/v3_release_factory.py
 
 ## 5. Checkpoint D — Real S1 physical acceptance
 
+### Checkpoint D0 — close Need-semantic acceptance before scaling
+
+1. Preserve the existing 20 physical-conformance-only Releases unchanged.
+2. Retain complete Host-executed diagnostic evidence rather than only its
+   digest and remove Builder-authored expected labels from the reviewer view.
+3. Run one fresh structured semantic review against the same frozen
+   BuilderProjection supplied to Builder, requiring every Requirement exactly
+   once with valid evidence references.
+4. Return all semantic failures in one factual Builder repair message while
+   its Codex thread remains open; permit one reviewer format correction only.
+5. Bind projection, physical evidence and accepted review into new Release
+   evidence. Publication rejects missing, failed, mismatched or tampered
+   qualification.
+6. Prove discrimination with missing-capability, wrong-state-transition and
+   wrong-refusal mutants across SQLite and filesystem/Git actors, with no
+   domain branch.
+
+Do not resume the 20-Need current campaign or S2 batch sampling until D0 is
+GREEN under real execution.
+
 ### Work
 
 1. Generate one filesystem/Git and one SQLite/stateful environment from fresh

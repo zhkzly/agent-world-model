@@ -13,6 +13,7 @@ from agent_env_foundry.release_v3 import (
     publish_release_v3_internal,
     verify_release_v3_internal,
 )
+from v3_release_factory import build_v3_release
 
 
 def _write(path: Path, text: str) -> None:
@@ -68,6 +69,10 @@ def _schemas() -> tuple[dict, dict, dict]:
 
 
 def _publish(tmp_path: Path):
+    return build_v3_release(tmp_path), tmp_path / "actor-project"
+
+
+def _publish_physical_only(tmp_path: Path):
     actor = _actor(tmp_path / "actor-project")
     actor_digest = compute_authored_project_digest(actor, "actor", require_locked_project=True)
     start, reset, state = _schemas()
@@ -100,6 +105,13 @@ def _publish(tmp_path: Path):
         state_schema=state,
     )
     return released, actor
+
+
+def test_internal_v3_publication_rejects_physical_only_self_evidence(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(EnvironmentContractError, match="semantic qualification"):
+        _publish_physical_only(tmp_path)
 
 
 def test_internal_v3_publication_contains_no_task_authority(tmp_path: Path) -> None:

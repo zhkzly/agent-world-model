@@ -24,6 +24,10 @@ from agent_env_foundry.diagnostic_scenarios import (
     parse_diagnostic_suite,
 )
 from agent_env_foundry.environment import JSONObject, JSONValue, ToolObservation, ToolSpec
+from agent_env_foundry.environment_semantic_qualification import (
+    SemanticQualification,
+    make_qualified_conformance_evidence,
+)
 from agent_env_foundry.physical_runtime import (
     ActorProxy,
     PreparationExecutionError,
@@ -37,6 +41,7 @@ from agent_env_foundry.physical_runtime import (
 )
 from agent_env_foundry.project_identity import compute_authored_project_digest
 from agent_env_foundry.release import canonical_bytes, sha256_hex
+from agent_env_foundry.research import BuilderProjection
 from agent_env_foundry.schema import (
     SchemaError,
     require_object_root,
@@ -63,6 +68,7 @@ class ConformedEnvironmentV3:
     reset_observation_schema: JSONObject
     state_schema: JSONObject
     tool_specs: tuple[ToolSpec, ...]
+    diagnostic_evidence: tuple[JSONObject, ...]
 
 
 def run_environment_conformance_v3_internal(
@@ -75,7 +81,20 @@ def run_environment_conformance_v3_internal(
 
     actor_root = Path(candidate.workspace)
     phases = tuple(item.phase for item in candidate.checks)
-    if phases != _EXPECTED_BUILDER_PHASES or not all(item.passed for item in candidate.checks):
+    base_checks = candidate.checks[: len(_EXPECTED_BUILDER_PHASES)]
+    trailing_checks = candidate.checks[len(_EXPECTED_BUILDER_PHASES) :]
+    if (
+        tuple(item.phase for item in base_checks) != _EXPECTED_BUILDER_PHASES
+        or not all(item.passed for item in base_checks)
+        or (
+            trailing_checks
+            and (
+                len(trailing_checks) != 1
+                or trailing_checks[0].phase != "semantic_qualification"
+                or not trailing_checks[0].passed
+            )
+        )
+    ):
         raise PreparationExecutionError(
             "EnvironmentDefect",
             "builder_evidence_incomplete",
@@ -153,7 +172,7 @@ def run_environment_conformance_v3_internal(
         actor_root,
         tool_names=tuple(item["name"] for item in tools),
     )
-    diagnostic_results = _run_diagnostic_suite(
+    diagnostic_results, diagnostic_evidence = _run_diagnostic_suite(
         runtime,
         diagnostic_suite,
         Path(runtime_root),
@@ -171,6 +190,7 @@ def run_environment_conformance_v3_internal(
             [item.to_document() for item in candidate.checks],
         ),
         "host_checks": {
+            "public_tool_specs": cast(JSONValue, [dict(item) for item in tools]),
             "tool_catalog_digest": sha256_hex(
                 canonical_bytes({"tools": [dict(item) for item in tools]})
             ),
@@ -186,6 +206,7 @@ def run_environment_conformance_v3_internal(
             "instance_isolation": True,
             "diagnostic_suite_digest": sha256_hex(canonical_bytes(diagnostic_suite.to_document())),
             "diagnostic_results": diagnostic_results,
+            "diagnostic_evidence": cast(JSONValue, list(diagnostic_evidence)),
         },
     }
     receipt = make_conformance_receipt(
@@ -198,7 +219,49 @@ def run_environment_conformance_v3_internal(
         tool_specs=tools,
         evidence=evidence,
     )
-    return ConformedEnvironmentV3(receipt, evidence, start, reset, state, tools)
+    return ConformedEnvironmentV3(
+        receipt,
+        evidence,
+        start,
+        reset,
+        state,
+        tools,
+        diagnostic_evidence,
+    )
+
+
+def bind_environment_semantics_v3(
+    conformed: ConformedEnvironmentV3,
+    *,
+    projection: BuilderProjection,
+    qualification: SemanticQualification,
+) -> ConformedEnvironmentV3:
+    evidence = make_qualified_conformance_evidence(
+        conformed.evidence,
+        projection=projection,
+        tool_specs=conformed.tool_specs,
+        diagnostic_evidence=conformed.diagnostic_evidence,
+        qualification=qualification,
+    )
+    receipt = make_conformance_receipt(
+        actor_project_digest=conformed.receipt.actor_project_digest,
+        actor_factory=conformed.receipt.actor_factory,
+        state_reader_factory=conformed.receipt.state_reader_factory,
+        start_schema=conformed.start_schema,
+        reset_observation_schema=conformed.reset_observation_schema,
+        state_schema=conformed.state_schema,
+        tool_specs=conformed.tool_specs,
+        evidence=evidence,
+    )
+    return ConformedEnvironmentV3(
+        receipt,
+        evidence,
+        conformed.start_schema,
+        conformed.reset_observation_schema,
+        conformed.state_schema,
+        conformed.tool_specs,
+        conformed.diagnostic_evidence,
+    )
 
 
 def _schema(
@@ -246,8 +309,9 @@ def _run_diagnostic_suite(
     reset_schema: JSONObject,
     state_schema: JSONObject,
     settings: PreparationSettings,
-) -> list[JSONValue]:
+) -> tuple[list[JSONValue], tuple[JSONObject, ...]]:
     results: list[JSONValue] = []
+    evidence: list[JSONObject] = []
     for scenario in suite.scenarios:
         first_root = runtime_root / f"diagnostic-{scenario.scenario_id}-a"
         second_root = runtime_root / f"diagnostic-{scenario.scenario_id}-b"
@@ -278,6 +342,7 @@ def _run_diagnostic_suite(
                 "identical diagnostic actions produced different observations or state",
                 scenario_id=scenario.scenario_id,
             )
+        evidence.append(_qualification_evidence(projected_first, scenario.scenario_id))
         results.append(
             {
                 "scenario_id": scenario.scenario_id,
@@ -285,7 +350,56 @@ def _run_diagnostic_suite(
                 "trace_digest": sha256_hex(canonical_bytes(projected_first)),
             }
         )
-    return results
+    return results, tuple(evidence)
+
+
+def _qualification_evidence(value: JSONValue, scenario_id: str) -> JSONObject:
+    if not isinstance(value, dict):
+        raise PreparationExecutionError(
+            "EnvironmentDefect",
+            "diagnostic_evidence_invalid",
+            "Host diagnostic execution did not produce an object",
+            scenario_id=scenario_id,
+        )
+    steps = value.get("steps")
+    if not isinstance(steps, list) or any(not isinstance(item, dict) for item in steps):
+        raise PreparationExecutionError(
+            "EnvironmentDefect",
+            "diagnostic_evidence_invalid",
+            "Host diagnostic execution did not produce structured steps",
+            scenario_id=scenario_id,
+        )
+    return {
+        "scenario_id": scenario_id,
+        "reset": {
+            "evidence_ref": f"{scenario_id}:reset",
+            "reset_observation": value.get("reset_observation"),
+            "initial_state": value.get("initial_state"),
+        },
+        "steps": [
+            {
+                "evidence_ref": f"{scenario_id}:step:{position}",
+                **cast(JSONObject, step),
+            }
+            for position, step in enumerate(steps)
+        ],
+        "lifecycle": [
+            {
+                "evidence_ref": f"{scenario_id}:reopen",
+                "operation": "close_reopen",
+                "before_state": value.get("final_state"),
+                "after_state": value.get("state_after_reopen"),
+            },
+            {
+                "evidence_ref": f"{scenario_id}:reset-after-actions",
+                "operation": "reset_after_actions",
+                "reset_observation": value.get("post_reset_observation"),
+                "before_state": value.get("state_after_reopen"),
+                "after_state": value.get("post_reset_state"),
+            },
+        ],
+        "final_state": value.get("final_state"),
+    }
 
 
 def _run_diagnostic_scenario(
@@ -298,19 +412,7 @@ def _run_diagnostic_scenario(
     settings: PreparationSettings,
 ) -> JSONObject:
     instance.mkdir(parents=True, exist_ok=True)
-    transport = _ChildTransport(
-        runtime.python,
-        Path(__file__).resolve().parent / "_actor_runner.py",
-        (ACTOR_FACTORY, str(instance.resolve())),
-        cwd=runtime.project_root,
-        timeout=settings.command_timeout_seconds,
-        role="actor",
-    )
-    actor = ActorProxy(
-        transport,
-        start_schema=start_schema,
-        reset_observation_schema=reset_schema,
-    )
+    actor = _open_candidate_actor(runtime, instance, start_schema, reset_schema, settings)
     trace_steps: list[JSONValue] = []
     try:
         reset_observation = actor.reset(scenario.reset)
@@ -332,15 +434,39 @@ def _run_diagnostic_scenario(
                 before_state,
                 current_state,
             )
-            trace_steps.append(
-                {
-                    "tool": step.tool,
-                    "arguments": step.arguments,
-                    "observation": cast(JSONValue, dict(observation)),
-                    "before_state": before_state,
-                    "after_state": current_state,
-                }
-            )
+            trace_step: JSONObject = {
+                "tool": step.tool,
+                "arguments": step.arguments,
+                "observation": cast(JSONValue, dict(observation)),
+                "before_state": before_state,
+                "after_state": current_state,
+            }
+            if canonical_bytes(before_state) != canonical_bytes(current_state):
+                actor.close()
+                actor = _open_candidate_actor(
+                    runtime,
+                    instance,
+                    start_schema,
+                    reset_schema,
+                    settings,
+                )
+                actor.tools()
+                state_after_step_reopen, _events = _read_candidate_state(
+                    runtime,
+                    instance,
+                    state_schema,
+                    settings,
+                )
+                if canonical_bytes(state_after_step_reopen) != canonical_bytes(current_state):
+                    raise PreparationExecutionError(
+                        "EnvironmentDefect",
+                        "diagnostic_step_reopen_persistence",
+                        "a successful state transition did not persist across immediate reopen",
+                        scenario_id=scenario.scenario_id,
+                        step=position,
+                    )
+                trace_step["state_after_reopen"] = state_after_step_reopen
+            trace_steps.append(trace_step)
     finally:
         actor.close()
     state_after_close, _events = _read_candidate_state(runtime, instance, state_schema, settings)
@@ -360,12 +486,33 @@ def _run_diagnostic_scenario(
             "diagnostic state changed after actor reopen",
             scenario_id=scenario.scenario_id,
         )
+    post_reset_observation, _tools = _reset_candidate(
+        runtime,
+        instance,
+        start_schema,
+        reset_schema,
+        settings,
+        start_value=scenario.reset,
+    )
+    post_reset_state, _events = _read_candidate_state(runtime, instance, state_schema, settings)
+    if canonical_bytes(post_reset_observation) != canonical_bytes(
+        reset_observation
+    ) or canonical_bytes(post_reset_state) != canonical_bytes(initial_state):
+        raise PreparationExecutionError(
+            "EnvironmentDefect",
+            "diagnostic_reset_restoration",
+            "reset after diagnostic actions did not restore the same controlled initial state",
+            scenario_id=scenario.scenario_id,
+        )
     return {
         "scenario_id": scenario.scenario_id,
         "reset_observation": reset_observation,
         "initial_state": initial_state,
         "steps": trace_steps,
         "final_state": current_state,
+        "state_after_reopen": state_after_reopen,
+        "post_reset_observation": post_reset_observation,
+        "post_reset_state": post_reset_state,
     }
 
 
@@ -441,6 +588,8 @@ def _reset_candidate(
     start: JSONObject,
     reset: JSONObject,
     settings: PreparationSettings,
+    *,
+    start_value: JSONObject | None = None,
 ) -> tuple[JSONValue, tuple[ToolSpec, ...]]:
     instance.mkdir(parents=True, exist_ok=True)
     transport = _ChildTransport(
@@ -458,10 +607,32 @@ def _reset_candidate(
     )
     try:
         tools = actor.tools()
-        observation = actor.reset(None)
+        observation = actor.reset(start_value)
         return observation, tools
     finally:
         actor.close()
+
+
+def _open_candidate_actor(
+    runtime: RuntimeLock,
+    instance: Path,
+    start: JSONObject,
+    reset: JSONObject,
+    settings: PreparationSettings,
+) -> ActorProxy:
+    transport = _ChildTransport(
+        runtime.python,
+        Path(__file__).resolve().parent / "_actor_runner.py",
+        (ACTOR_FACTORY, str(instance.resolve())),
+        cwd=runtime.project_root,
+        timeout=settings.command_timeout_seconds,
+        role="actor",
+    )
+    return ActorProxy(
+        transport,
+        start_schema=start,
+        reset_observation_schema=reset,
+    )
 
 
 def _reopen_candidate(
@@ -514,4 +685,8 @@ def _read_candidate_state(
     return first, [event.to_document() for event in events]
 
 
-__all__ = ["ConformedEnvironmentV3", "run_environment_conformance_v3_internal"]
+__all__ = [
+    "ConformedEnvironmentV3",
+    "bind_environment_semantics_v3",
+    "run_environment_conformance_v3_internal",
+]

@@ -12,6 +12,10 @@ from agent_env_foundry.conformance_v3 import (
     conformance_receipt_from_document,
 )
 from agent_env_foundry.environment import JSONObject
+from agent_env_foundry.environment_semantic_qualification import (
+    QualifiedSemanticEvidence,
+    qualified_semantic_evidence_from_document,
+)
 from agent_env_foundry.errors import EnvironmentContractError
 from agent_env_foundry.project_identity import (
     compute_authored_project_digest,
@@ -55,6 +59,7 @@ class ValidatedReleaseV3:
     state_schema: JSONObject
     receipt: EnvironmentConformanceReceipt
     release_id: str
+    semantic_evidence: QualifiedSemanticEvidence
 
 
 def publish_release_v3_internal(
@@ -73,6 +78,14 @@ def publish_release_v3_internal(
     actual_actor_digest = compute_authored_project_digest(
         Path(actor_project), "actor", require_locked_project=True
     )
+    try:
+        semantic_evidence = qualified_semantic_evidence_from_document(evidence)
+    except ValueError as exc:
+        raise EnvironmentContractError(
+            f"v3 semantic qualification evidence is invalid: {exc}"
+        ) from exc
+    if semantic_evidence.qualification.actor_project_digest != actual_actor_digest:
+        raise EnvironmentContractError("v3 semantic qualification actor authority mismatch")
     expected = {
         "actor_project_digest": actual_actor_digest,
         "start_schema_digest": sha256_hex(canonical_bytes(start_schema)),
@@ -236,6 +249,19 @@ def verify_release_v3_internal(release_root: Path) -> ValidatedReleaseV3:
     )
     if receipt.evidence_digest != sha256_hex(canonical_bytes(evidence)):
         raise EnvironmentContractError("v3 conformance evidence digest mismatch")
+    try:
+        semantic_evidence = qualified_semantic_evidence_from_document(evidence)
+    except ValueError as exc:
+        raise EnvironmentContractError(
+            f"v3 semantic qualification evidence is invalid: {exc}"
+        ) from exc
+    if semantic_evidence.qualification.actor_project_digest != descriptor.actor_project_digest:
+        raise EnvironmentContractError("v3 semantic qualification actor authority mismatch")
+    semantic_tool_digest = sha256_hex(
+        canonical_bytes({"tools": [dict(item) for item in semantic_evidence.tool_specs]})
+    )
+    if semantic_tool_digest != receipt.tool_catalog_digest:
+        raise EnvironmentContractError("v3 semantic qualification tool authority mismatch")
     return ValidatedReleaseV3(
         root,
         descriptor,
@@ -245,6 +271,7 @@ def verify_release_v3_internal(release_root: Path) -> ValidatedReleaseV3:
         state,
         receipt,
         sha256_hex(descriptor_bytes),
+        semantic_evidence,
     )
 
 

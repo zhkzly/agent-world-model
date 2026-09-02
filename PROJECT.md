@@ -45,6 +45,16 @@ conditions, qualification goals, answer fields, positive/noop Task cases,
 TaskSemantics, task-specific auditors, concrete Tasks, reference traces, Task
 checkers, corpus cells, rewards or trajectories.
 
+Physical conformance is necessary but not sufficient. Before publication, one
+fresh semantic reviewer receives the frozen Need-derived BuilderProjection,
+public ToolSpecs and complete Host-executed diagnostic observations with
+protected before/after state. It must judge every frozen Requirement exactly
+once and cite only Host-assigned evidence references. Missing evidence is a
+failure. Framework derives coverage, identities and the release verdict; the
+Builder's tests, scenario expectations and self-report cannot establish
+semantic acceptance. The accepted projection, physical evidence and review are
+bound into the Release evidence without creating Tasks, answers or rewards.
+
 The protected state projection is environment-specific but Task-neutral. It
 allows S2 checkers to read real before/after facts after close/reopen; it never
 defines success and is never visible to an acting policy.

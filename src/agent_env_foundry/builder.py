@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ import rfc8785
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
 from agent_env_foundry.diagnostic_scenarios import DIAGNOSTIC_SCENARIOS_PATH
+from agent_env_foundry.environment import JSONObject
 from agent_env_foundry.physical_runtime import (
     PreparationSettings,
 )
@@ -168,6 +170,7 @@ class CandidateBuild:
     candidate_digest: str
     final_response: str
     checks: tuple[CommandResult, ...]
+    acceptance: JSONObject | None = None
 
 
 def _file_digest(path: Path) -> str:
@@ -599,6 +602,7 @@ def run_builder(
     root: Path,
     *,
     config: BuilderConfig | None = None,
+    acceptance_check: Callable[[CandidateBuild], CommandResult] | None = None,
 ) -> CandidateBuild:
     selected = config or BuilderConfig()
     prepared = prepare_builder_workspace(
@@ -645,13 +649,40 @@ def run_builder(
                 last_checks = run_candidate_checks(prepared.root, selected)
                 digest = compute_candidate_digest(prepared.root)
                 if last_checks and all(item.passed for item in last_checks):
-                    return CandidateBuild(
+                    candidate = CandidateBuild(
                         prepared.root,
                         thread.id,
                         digest,
                         last_response,
                         last_checks,
                     )
+                    if acceptance_check is None:
+                        return candidate
+                    acceptance_result = acceptance_check(candidate)
+                    last_checks = (*last_checks, acceptance_result)
+                    if acceptance_result.passed:
+                        try:
+                            acceptance = json.loads(acceptance_result.stdout)
+                        except json.JSONDecodeError as exc:
+                            raise BuilderFailure(
+                                "semantic_qualification",
+                                "semantic_qualification_report_invalid",
+                                "passing semantic qualification returned invalid JSON",
+                            ) from exc
+                        if not isinstance(acceptance, dict):
+                            raise BuilderFailure(
+                                "semantic_qualification",
+                                "semantic_qualification_report_invalid",
+                                "passing semantic qualification must return a JSON object",
+                            )
+                        return CandidateBuild(
+                            prepared.root,
+                            thread.id,
+                            digest,
+                            last_response,
+                            last_checks,
+                            acceptance,
+                        )
                 if previous_failed_digest == digest:
                     failed = next(item for item in last_checks if not item.passed)
                     raise BuilderFailure(
