@@ -133,7 +133,6 @@ def _final(*, schema: dict | None = None) -> dict:
         ),
         "final_answer_schema_json": json.dumps(answer_schema),
         "proposed_final_answer_json": json.dumps({"counter_id": "counter-main", "count": 2}),
-        "challenge_categories": ["wrong_target", "collateral", "wrong_target"],
     }
 
 
@@ -165,12 +164,7 @@ def test_direct_proposal_uses_public_tools_and_host_captures_protected_evidence(
     )
 
     assert result.candidate.instruction.startswith("Increase counter-main")
-    assert result.candidate.challenge_categories == (
-        "no_op",
-        "wrong_answer",
-        "wrong_target",
-        "collateral",
-    )
+    assert "challenge_categories" not in result.candidate.to_document()
     assert result.evidence.before_state == {"counters": [{"id": "counter-main", "count": 0}]}
     assert result.evidence.after_state == {"counters": [{"id": "counter-main", "count": 2}]}
     assert result.evidence.evidence_id == result.candidate.proposal_evidence_digest
@@ -180,7 +174,7 @@ def test_direct_proposal_uses_public_tools_and_host_captures_protected_evidence(
     assert "before_state" not in first_input
     assert "after_state" not in first_input
     assert "checker_brief" not in first_input
-    assert "uniqueItems" not in proposal_schema["properties"]["challenge_categories"]
+    assert "challenge_categories" not in proposal_schema["properties"]
 
 
 def test_direct_proposal_returns_nested_contract_error_for_same_history_repair(

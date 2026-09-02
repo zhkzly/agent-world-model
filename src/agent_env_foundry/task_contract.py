@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
@@ -29,20 +29,6 @@ TASK_CHECK_REQUEST_FORMAT = "task-check-request/1"
 TASK_CHECK_RESULT_FORMAT = "task-check-result/1"
 CHECKER_FACTORY = "generated_task_checker.release:check_task"
 
-type ChallengeCategory = Literal[
-    "no_op",
-    "wrong_answer",
-    "wrong_target",
-    "partial",
-    "collateral",
-]
-_CHALLENGE_ORDER: tuple[ChallengeCategory, ...] = (
-    "no_op",
-    "wrong_answer",
-    "wrong_target",
-    "partial",
-    "collateral",
-)
 _CHECK_RESULT_KEYS = frozenset(
     {
         "format",
@@ -137,7 +123,6 @@ class CandidateTaskContract:
     final_answer_schema: JSONObject
     checker_brief: str
     proposal_evidence_digest: str
-    challenge_categories: tuple[ChallengeCategory, ...]
 
     def __post_init__(self) -> None:
         if self.format != CANDIDATE_TASK_FORMAT:
@@ -151,10 +136,8 @@ class CandidateTaskContract:
         if reset is not None and not is_json_object(reset):
             raise ValueError("reset_start must be a JSON object or null")
         schema = _answer_schema(self.final_answer_schema)
-        categories = _challenges(self.challenge_categories)
         object.__setattr__(self, "reset_start", _copy_object(reset) if reset is not None else None)
         object.__setattr__(self, "final_answer_schema", schema)
-        object.__setattr__(self, "challenge_categories", categories)
 
     @property
     def candidate_id(self) -> str:
@@ -172,7 +155,6 @@ class CandidateTaskContract:
             "final_answer_schema": _copy_object(self.final_answer_schema),
             "checker_brief": self.checker_brief,
             "proposal_evidence_digest": self.proposal_evidence_digest,
-            "challenge_categories": list(self.challenge_categories),
         }
 
 
@@ -187,7 +169,6 @@ class TaskContract:
     final_answer_schema: JSONObject
     checker_project_digest: str
     checker_factory: str
-    challenge_categories: tuple[ChallengeCategory, ...]
 
     def __post_init__(self) -> None:
         if self.format != TASK_CONTRACT_FORMAT:
@@ -207,7 +188,6 @@ class TaskContract:
             raise ValueError("reset_start must be a JSON object or null")
         object.__setattr__(self, "reset_start", _copy_object(reset) if reset is not None else None)
         object.__setattr__(self, "final_answer_schema", _answer_schema(self.final_answer_schema))
-        object.__setattr__(self, "challenge_categories", _challenges(self.challenge_categories))
 
     @property
     def task_id(self) -> str:
@@ -226,7 +206,6 @@ class TaskContract:
             "final_answer_schema": _copy_object(self.final_answer_schema),
             "checker_project_digest": self.checker_project_digest,
             "checker_factory": self.checker_factory,
-            "challenge_categories": list(self.challenge_categories),
         }
 
     def public_document(self) -> JSONObject:
@@ -345,7 +324,6 @@ def seal_task_contract(
         candidate.final_answer_schema,
         checker_project_digest,
         checker_factory,
-        candidate.challenge_categories,
     )
 
 
@@ -404,19 +382,6 @@ def _answer_schema(document: JSONObject) -> JSONObject:
     return schema
 
 
-def _challenges(values: tuple[ChallengeCategory, ...]) -> tuple[ChallengeCategory, ...]:
-    if not isinstance(values, tuple) or len(set(values)) != len(values):
-        raise ValueError("challenge_categories must be a unique tuple")
-    if any(value not in _CHALLENGE_ORDER for value in values):
-        raise ValueError("challenge_categories contains an unsupported category")
-    expected = tuple(value for value in _CHALLENGE_ORDER if value in values)
-    if values != expected or not {"no_op", "wrong_answer"} <= set(values):
-        raise ValueError(
-            "challenge_categories must be canonical and include no_op and wrong_answer"
-        )
-    return values
-
-
 def _text(value: str, role: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{role} must be non-empty text")
@@ -450,7 +415,6 @@ __all__ = [
     "TASK_CONTRACT_FORMAT",
     "TASK_PROPOSAL_EVIDENCE_FORMAT",
     "CandidateTaskContract",
-    "ChallengeCategory",
     "TaskCheckRequest",
     "TaskCheckResult",
     "TaskContract",

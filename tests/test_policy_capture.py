@@ -563,6 +563,37 @@ def test_responses_request_normalizes_mechanical_zero_argument_schema(
     }
 
 
+def test_responses_wire_projects_collection_consts_without_changing_host_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    responses = Responses([_call_response()])
+    driver = ResponsesPolicyDriver.from_route(
+        AgentRoute(), client_factory=lambda **_kwargs: Client(responses)
+    )
+    answer_schema = {
+        "type": "object",
+        "properties": {"paths": {"const": ["README.md"]}, "clean": {"const": True}},
+        "required": ["paths", "clean"],
+        "additionalProperties": False,
+    }
+    public_input = PublicEpisodeInput(
+        PUBLIC_AGENT_SYSTEM_PROMPT,
+        "Inspect state.",
+        {},
+        (_tool(),),
+        answer_schema,
+    )
+
+    driver.start(public_input)
+    driver.next_decision(())
+
+    wire = responses.requests[0]["text"]["format"]["schema"]["properties"]
+    assert wire["paths"] == {"type": "array", "items": {"type": "string"}}
+    assert wire["clean"] == {"const": True, "type": "boolean"}
+    assert answer_schema["properties"]["paths"] == {"const": ["README.md"]}
+
+
 def test_host_rejects_duplicate_call_ids() -> None:
     duplicate = _capture(
         ScriptedDriver(

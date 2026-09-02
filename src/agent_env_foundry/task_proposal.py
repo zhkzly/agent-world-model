@@ -28,18 +28,10 @@ from agent_env_foundry.task_contract import (
     CANDIDATE_TASK_FORMAT,
     TASK_PROPOSAL_EVIDENCE_FORMAT,
     CandidateTaskContract,
-    ChallengeCategory,
     TaskProposalEvidence,
 )
 
 _PROVIDER_TURN_TIMEOUT_SECONDS = 180.0
-_CHALLENGE_ORDER: tuple[ChallengeCategory, ...] = (
-    "no_op",
-    "wrong_answer",
-    "wrong_target",
-    "partial",
-    "collateral",
-)
 _PROPOSAL_SCHEMA: JSONObject = {
     "type": "object",
     "properties": {
@@ -47,20 +39,12 @@ _PROPOSAL_SCHEMA: JSONObject = {
         "checker_brief": {"type": "string", "minLength": 1},
         "final_answer_schema_json": {"type": "string", "minLength": 1},
         "proposed_final_answer_json": {"type": "string", "minLength": 1},
-        "challenge_categories": {
-            "type": "array",
-            "items": {
-                "type": "string",
-                "enum": list(_CHALLENGE_ORDER),
-            },
-        },
     },
     "required": [
         "instruction",
         "checker_brief",
         "final_answer_schema_json",
         "proposed_final_answer_json",
-        "challenge_categories",
     ],
     "additionalProperties": False,
 }
@@ -76,9 +60,8 @@ After at least one real public tool call, return the required structured proposa
 object-root Draft 2020-12 final-answer schema and your observed final answer as JSON strings.
 The checker brief is private input for a later independent code author: state the intended goal,
 required and forbidden effects, answer relation, and any genuinely required process evidence.
-Select only physically meaningful negative categories. The Host will always require no_op and
-wrong_answer and will independently capture protected before/after state; you cannot see or
-define that state and you do not decide whether the Task is admitted.
+The Host applies one universal admission procedure and independently captures protected
+before/after state; you cannot see or define that state and you do not decide admission.
 """
 
 ProposalFailureKind = Literal[
@@ -145,7 +128,6 @@ class _ProposalFields:
     checker_brief: str
     final_answer_schema: JSONObject
     proposed_final_answer: JSONObject
-    challenge_categories: tuple[ChallengeCategory, ...]
 
 
 def propose_task_direct(
@@ -309,7 +291,6 @@ def propose_task_direct(
         fields.final_answer_schema,
         fields.checker_brief,
         evidence.evidence_id,
-        fields.challenge_categories,
     )
     return ProposedTask(candidate, evidence, provider_turns, tuple(usage))
 
@@ -472,7 +453,6 @@ def _proposal_fields(output_text: str) -> _ProposalFields:
             answer_schema,
             cast(str, document["checker_brief"]),
             "0" * 64,
-            _challenge_categories(cast(list[Any], document["challenge_categories"])),
         )
         validate_instance(answer, answer_schema, role="proposed_final_answer")
     except (SchemaError, ValueError) as exc:
@@ -482,7 +462,6 @@ def _proposal_fields(output_text: str) -> _ProposalFields:
         cast(str, document["checker_brief"]),
         answer_schema,
         answer,
-        _challenge_categories(cast(list[Any], document["challenge_categories"])),
     )
 
 
@@ -496,15 +475,6 @@ def _nested_object(value: Any, role: str) -> JSONObject:
     if not is_json_object(decoded):
         raise ValueError(f"{role} must decode to a JSON object")
     return cast(JSONObject, decoded)
-
-
-def _challenge_categories(values: Sequence[Any]) -> tuple[ChallengeCategory, ...]:
-    invalid = [value for value in values if value not in _CHALLENGE_ORDER]
-    if invalid:
-        raise ValueError(f"challenge_categories contains unsupported values: {invalid!r}")
-    selected = {cast(ChallengeCategory, value) for value in values}
-    selected.update(("no_op", "wrong_answer"))
-    return tuple(value for value in _CHALLENGE_ORDER if value in selected)
 
 
 def _output_items(response: Any) -> list[Any]:

@@ -290,3 +290,12 @@ only semantic code authority and froze a new Task identity before any witness.
 The sole rework removed an unsupported Responses `uniqueItems` keyword while
 retaining deterministic Host deduplication; no retry, compatibility path,
 domain branch or old `evaluate_atom` dependency was added.
+
+`s2-direct-sampler-cut|介入3|返工1|revert 2637 lines+delete old S2/S3 9379 lines+real zero-challenge TaskPack+full suite|红线违反1`
+
+The user identified that per-Task physical challenges were pressure-testing
+our checker implementation rather than sampling Tasks. Commit `219d318` was
+reverted intact. The replacement uses one universal path—executed proposal,
+checker sanity and two fresh public solves—and emits no challenge categories.
+Old ForEach/If, batch/assessment and Episode product code was deleted before
+further feature work; the retained canary artifacts remain diagnostic only.

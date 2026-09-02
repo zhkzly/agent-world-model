@@ -52,6 +52,12 @@ def test_abandoned_parallel_b_modules_are_deleted() -> None:
         "src/agent_env_foundry/requirement_obligations.py",
         "src/agent_env_foundry/task_specification.py",
         "src/agent_env_foundry/task_binding.py",
+        "src/agent_env_foundry/assessment.py",
+        "src/agent_env_foundry/batch_foundry.py",
+        "src/agent_env_foundry/episode_batch.py",
+        "src/agent_env_foundry/episode_runtime.py",
+        "src/agent_env_foundry/foreach_foundry.py",
+        "src/agent_env_foundry/if_foundry.py",
         ".trellis/spec/backend/s2-task-specification.md",
     ):
         assert not (ROOT / relative).exists(), relative

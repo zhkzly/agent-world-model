@@ -59,7 +59,6 @@ def _candidate() -> CandidateTaskContract:
             "unrelated records stay unchanged, and the answer reports its exact ID/status."
         ),
         proposal_evidence_digest=evidence.evidence_id,
-        challenge_categories=("no_op", "wrong_answer", "wrong_target", "collateral"),
     )
 
 

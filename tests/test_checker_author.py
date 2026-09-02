@@ -10,11 +10,16 @@ from agent_env_foundry.checker_author import (
     CheckerAuthorInputError,
     compute_checker_project_digest,
     execute_checker_project,
+    execute_task_checker,
     prepare_checker_author_workspace,
     run_checker_checks,
 )
 from agent_env_foundry.physical_runtime import PreparationSettings
-from agent_env_foundry.task_contract import CandidateTaskContract, TaskProposalEvidence
+from agent_env_foundry.task_contract import (
+    CandidateTaskContract,
+    TaskProposalEvidence,
+    make_task_check_request,
+)
 
 
 def _evidence() -> TaskProposalEvidence:
@@ -71,7 +76,6 @@ def _candidate(evidence: TaskProposalEvidence) -> CandidateTaskContract:
             "reports req-1/approved. A public approve_request call for req-1 is required."
         ),
         evidence.evidence_id,
-        ("no_op", "wrong_answer", "wrong_target", "collateral"),
     )
 
 
@@ -197,6 +201,20 @@ def test_real_checker_project_passes_host_contract_and_executes_twice(tmp_path: 
     assert result.passed
     assert task.checker_project_digest == digest
     assert task.task_id
+    request = make_task_check_request(
+        task,
+        before_state=evidence.before_state,
+        after_state=evidence.after_state,
+        public_trace=evidence.public_trace,
+        final_answer=evidence.proposed_final_answer,
+    )
+    assert execute_task_checker(
+        prepared.root,
+        task=task,
+        request=request,
+        runtime_root=tmp_path / "second-runtime",
+        settings=PreparationSettings(tmp_path / "uv-cache", 120.0),
+    ).passed
 
 
 def test_checker_source_cannot_import_actor_or_host(tmp_path: Path) -> None:

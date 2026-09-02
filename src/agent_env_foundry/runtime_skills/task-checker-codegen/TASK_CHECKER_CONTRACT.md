@@ -51,10 +51,11 @@ the Host package, TaskSemantics, another verifier, an LLM, network, subprocess,
 filesystem, environment variables, wall clock, randomness, or mutable global
 state. It receives all authority through the request.
 
-Write meaningful tests for the supplied positive example and discriminating
-no-op, wrong-answer, wrong-target, partial and collateral examples where the
-candidate declares them applicable. Tests are diagnostic; Host checks and
-later physical challenges decide acceptance.
+Write meaningful tests for the supplied positive example, an unchanged no-op
+and a schema-valid wrong answer. Add ordinary task-specific semantic unit tests
+when useful, but do not create an adversarial execution pipeline or additional
+Task admission categories. Tests are diagnostic; Host checks decide
+acceptance.
 
 Do not write a TaskContract, TaskPack, receipt, reward, witness, assessment or
 corpus artifact. Do not edit the immutable input files.

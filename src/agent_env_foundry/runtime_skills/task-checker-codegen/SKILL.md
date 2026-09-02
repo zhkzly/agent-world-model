@@ -14,7 +14,8 @@ description: Author one pure task-specific checker from a frozen candidate and r
 4. Keep required effects, forbidden effects, answer and process axes separate;
    `passed` must be their conjunction.
 5. Accept alternative valid tool sequences and irrelevant ordering differences.
-6. Add positive and discriminating negative tests, run the project commands,
+6. Add a positive, no-op and wrong-answer test plus ordinary semantic unit
+   tests appropriate to this task. Run the project commands,
    and repair all factual failures. Framework checks—not your final response—
    determine acceptance.
 
