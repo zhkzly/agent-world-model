@@ -24,9 +24,9 @@ natural-language Need
 
 ## S1 owns the executable environment
 
-S1 researches the Need, builds a real uv-managed actor project, executes real
-public tools against real persistent state, independently qualifies reusable
-environment semantics and publishes immutable bytes.
+S1 researches the Need, builds one real uv-managed actor project, executes real
+public tools against real persistent state, qualifies environment behavior and
+publishes immutable bytes.
 
 The release exposes two mechanically separated surfaces:
 
@@ -35,32 +35,43 @@ public actor
   reset / tools / invoke / close
 
 protected trusted runtime
-  deterministic StartCases
-  read-only native facts
-  qualified CapabilitySpecs and Conditions
-  binding enumeration
-  atomic outcome/answer/process evaluation
+  task-neutral read_state over real persistent facts
 ```
 
-S1 does not publish concrete Tasks, reference traces, Task checkers, corpus
-cells, rewards or trajectories. It may expose environment-specific reusable
-truth operations, but it must not preselect the S2 Task distribution.
+S1 validates actor build/lock identity, ToolSpec and observed schema
+conformance, reset/replay, persistence, isolation, protected readback,
+packaging, relocation and cold preparation. It does not publish CapabilitySpecs,
+conditions, qualification goals, answer fields, positive/noop Task cases,
+TaskSemantics, task-specific auditors, concrete Tasks, reference traces, Task
+checkers, corpus cells, rewards or trajectories.
+
+The protected state projection is environment-specific but Task-neutral. It
+allows S2 checkers to read real before/after facts after close/reopen; it never
+defines success and is never visible to an acting policy.
 
 ## S2 owns sampling good Tasks
 
-The required S2 path is Direct Goal-first sampling over one exact release:
+The required S2 path is Direct proposal and physical admission over one exact
+release:
 
 ```text
-qualified Capability / StartCase / Binding / Condition
--> deterministic Candidate Task enumeration
--> semantic-structure deduplication and selection
+Need + Development Brief + public ToolSpecs + fresh execution
+-> Candidate Task proposal
+-> one sealed TaskContract and task-specific checker
 -> freeze checker and final instruction
 -> two fresh public-only Agent executions
--> real state/answer verification and applicable physical challenges
+-> real before/after state, answer and applicable physical challenges
 -> TaskPack
 -> separate TaskAssessment
 -> CorpusManifest
 ```
+
+The proposal Agent can suggest a Task but cannot seal truth. One checker project
+is the sole semantic authority for one candidate Task. It consumes real
+before/after state, public trace and final answer; independent Agents may
+challenge and reject it but cannot create a second peer truth program or mutate
+an admitted contract. A failed Task candidate never invalidates its
+EnvironmentRelease.
 
 Graph and Programmatic are optional sampler/search experiments. They may be
 evaluated only after the Direct path demonstrates a concrete coverage gap, and
@@ -139,19 +150,20 @@ same path; there is no second Agent loop, service or Registry.
 
 ### Framework Python
 
-Owns release preparation, identities, Direct candidate enumeration, checker
-freeze/execution, instruction rendering, provenance, admission, structural
-deduplication, TaskPack persistence, assessment recording, corpus selection,
-Episode lifecycle, deterministic Reward/abstention and cold artifact
-projections.
+Owns environment conformance/publication, release preparation, identities,
+TaskContract/checker freeze and execution, instruction rendering, provenance,
+admission, structural deduplication, TaskPack persistence, assessment
+recording, corpus selection, Episode lifecycle, deterministic
+Reward/abstention and cold artifact projections.
 
 ### Python Codex SDK
 
-Authors only the three isolated S1 release-local projects:
+Authors only isolated semantic code projects:
 
-1. executable actor environment;
-2. protected TaskSemantics;
-3. mutually blind qualification-only Native Auditor.
+1. the S1 executable actor environment, including task-neutral protected state
+   readback;
+2. one S2 task-specific checker for each candidate Task that reaches checker
+   authoring.
 
 Generated code never decides release admission, Task admission, identity or
 reward.
@@ -167,17 +179,17 @@ interface.
 ## Non-negotiable constraints
 
 1. Public tools execute real project code and real persistent transitions.
-2. Protected facts may select and verify a Task but never supply acting operands.
+2. Protected state may propose and verify a Task but never supply acting operands.
 3. Checker and final instruction freeze before the witness or target policy executes.
 4. The policy solves exactly the instruction exposed by the TaskPack.
 5. LLM agreement cannot override deterministic execution/state failure.
-6. Starts are reset-only; no hidden setup calls or native writes.
+6. Acting starts are reset-only; no hidden setup calls or native writes.
 7. Framework contains no booking/SQLite/Git/domain branches.
 8. Witness proves existence of a public solution, never the only valid path.
 9. TaskPack identity excludes assessment, difficulty, corpus policy and Episodes.
 10. Episode reward cannot change Task truth or use TaskAssessment reliability.
 11. Provider/trust defects abstain rather than become model reward zero.
-12. Unsupported semantics and low sampling yield remain typed outcomes.
+12. Unsupported semantics and low Task yield remain typed outcomes; they do not revoke a valid Release.
 13. Only current clean-break formats are supported; no compatibility switch.
 14. Intermediate checkpoints, candidate counts and successful demos are never stage completion.
 
@@ -188,7 +200,7 @@ S2 completes only when the frozen Direct Framework:
 - samples, deduplicates and admits Tasks through the production batch API;
 - cold-consumes contrasting filesystem/Git and SQLite releases;
 - produces real query, state-change, refusal, collection/condition and composed
-  Tasks only where the release supports them;
+  Tasks only where executed environment evidence supports them;
 - proves fresh public solvability, reload/isolation and applicable negative
   discrimination for every admitted TaskPack;
 - cold-reads relocated TaskPacks into a non-leaking PublicTaskView;

@@ -41,8 +41,8 @@
 ```text
 PROJECT.md
 .trellis/spec/backend/s1-coordinator.md
-.trellis/spec/backend/v2-preparation.md (replace/supersede as v3)
-.trellis/spec/backend/v2-qualification-publication.md (replace/supersede)
+.trellis/spec/backend/v3-preparation.md
+.trellis/spec/backend/v3-conformance-publication.md
 tests/test_release_v3.py
 tests/test_product_authority.py
 ```
@@ -245,4 +245,3 @@ satisfy Checkpoints D, F or G.
 6. Did code/tests/docs delete the superseded authority instead of wrapping it?
 7. What real physical execution proves the checkpoint, and what remains
    unproven?
-

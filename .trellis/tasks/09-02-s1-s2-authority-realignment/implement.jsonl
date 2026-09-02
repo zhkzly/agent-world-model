@@ -1,8 +1,8 @@
 {"file":"PROJECT.md","reason":"Stable product authority that the user explicitly authorized this task to revise; update must remain paper-grade and self-consistent."}
 {"file":"DECISIONS.md","reason":"Clean-break, deletion-first, Framework/Agent ownership and anti-overdesign history."}
 {"file":".trellis/spec/backend/s1-coordinator.md","reason":"Current S1 stage order and failure matrix to replace with environment-only conformance."}
-{"file":".trellis/spec/backend/v2-preparation.md","reason":"Current actor+semantics materialization boundary whose reusable actor isolation must survive the v3 cutover."}
-{"file":".trellis/spec/backend/v2-qualification-publication.md","reason":"Current task-case S1 qualification authority to supersede, not wrap or preserve as compatibility."}
+{"file":".trellis/spec/backend/v3-preparation.md","reason":"Approved one-actor materialization boundary whose public/protected isolation must govern the v3 cutover."}
+{"file":".trellis/spec/backend/v3-conformance-publication.md","reason":"Approved environment-only conformance, receipt and publication authority."}
 {"file":".trellis/spec/backend/s2-assessment-corpus.md","reason":"Task/Assessment/Corpus identity separation and public assessment behavior to retain after checker redesign."}
 {"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/prd.md","reason":"Accepted Good-Task intrinsic gates and physical evidence requirements that remain S2-owned."}
 {"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/design.md","reason":"Current Direct Task pipeline and old release-local semantics dependencies to replace without duplicating public Agent or artifact logic."}

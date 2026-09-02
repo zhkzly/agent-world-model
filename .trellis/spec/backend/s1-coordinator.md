@@ -1,96 +1,69 @@
-# S1 v2 Coordinator Contract
+# S1 EnvironmentRelease/3 Coordinator Contract
 
-## 1. Scope / Trigger
+## Scope
 
-Use this contract for the future direct Python coordinator from one natural
-language Need to one admitted EnvironmentRelease v2. The coordinator does not
-currently exist at HEAD and must not be claimed implemented until its real
-cross-domain acceptance passes.
+Use this contract for the sole direct Python path from one natural-language
+Need to one cold EnvironmentRelease/3. S1 publishes an executable world; it
+does not generate or qualify Tasks.
 
-## 2. Signature
+## Signature and order
 
 ```python
-generate_environment_v2(
+generate_environment(
     need_text: str,
     *,
     config: GenerationConfig,
 ) -> Released | NotReleased | Unsupported
 ```
 
-The imperative order is:
-
 ```text
-Research
+Need preservation
+-> Research / Development Brief
 -> actor Builder
--> expected-semantics freeze
--> mutually blind TaskSemantics and Verifier Authors
--> Core derivation
--> physical Qualification
--> Publication
--> cold verification/replay
+-> public + protected-state surface freeze
+-> environment conformance
+-> EnvironmentRelease/3 publication
+-> ZIP + cold verification/preparation
 ```
 
-A CLI may wrap this API after the API exists. CLI existence never proves the
-coordinator or release is complete.
+There is no v2 fallback, semantics-author branch, task-case Qualification or
+provisional Release.
 
-## 3. Contracts
+## Contracts
 
-- Preserve `NeedRecord.original_need` exactly and derive wrapping-invariant
-  coverage anchors.
-- Generated projects are standalone uv workspaces created with absolute paths
-  and `uv init --no-workspace`; parent project bytes remain unchanged.
-- Freeze expected semantics before exposing actor source/native details.
-- TaskSemantics and verifier workspaces/threads are fresh and mutually blind.
-- Derive one acyclic Core ID; Qualification binds Core, not final Release ID.
-- Publish only from a passed strict receipt and immutable frozen bytes.
-- Cold verification uses archived actor/semantics/verifier/evidence bytes.
-- Any stage failure returns a typed non-release outcome; there is no v1 fallback.
+- Preserve `NeedRecord.original_need` exactly.
+- Build one standalone uv project with public `make_environment` and protected
+  task-neutral `read_state` entrypoints.
+- Public behavior remains `reset / tools / invoke / close` over real persistent
+  state.
+- `read_state` is deterministic, schema-valid, read-only and invisible to an
+  acting policy.
+- Conformance binds exact actor bytes, ToolSpecs, start/reset/state schemas,
+  physical replay/persistence/isolation evidence and cold package bytes.
+- Any stage failure returns a typed non-release outcome and emits no later
+  artifact.
+- CapabilitySpecs, TaskSemantics, answer fields, Task checkers, witnesses and
+  rewards are forbidden S1 output.
 
-## 4. Validation & Error Matrix
+## Failure matrix
 
 | Condition | Required result |
 | --- | --- |
-| Empty Need | `NotReleased(invalid_need)` |
+| empty or malformed Need | `NotReleased(invalid_need)` |
 | Research cannot close | typed Research failure; no Builder |
-| Actor build fails | `EnvironmentDefect` or Infrastructure; no semantic authors |
-| Expected semantics incomplete | fail before source exposure |
-| Semantics/verifier author failure | typed owner; no Core Qualification |
-| Core byte changes | invalidate all descendant evidence |
-| Qualification not passed | no Publication |
-| Receipt/layout/cold replay fails | no released ID |
-| v1 input/output requested | unsupported; no conversion |
+| actor build/test/lock fails | Environment or Infrastructure; no conformance |
+| public/state surface invalid | Environment defect; no publication |
+| reset/replay/persistence/isolation/readback fails | conformance failure; no publication |
+| receipt/layout/ZIP/cold prepare fails | Publication failure; no released ID |
+| old format requested | unsupported; no conversion |
+| downstream Task proposal fails | not an S1 event; Release remains valid |
 
-## 5. Good / Base / Bad Cases
+## Required evidence
 
-- Good: SQLite and filesystem/Git Needs use the same coordinator and Framework
-  code with separate generated projects.
-- Base: exact Core qualifies, seals, relocates and cold replays to one Release ID.
-- Bad: restore deleted `api.py/cli.py/qualification.py/publication.py` wholesale.
-- Bad: let one generated semantic package authorize its own receipt.
-- Bad: expose an unqualified/pending release to S2.
-
-## 6. Tests Required
-
-- Need wrapping equivalence and parent workspace immutability.
-- Three author input-visibility matrices and immutable input checks.
-- Per-stage fail-closed absence of later calls/artifacts.
-- Core/receipt/Release identity DAG mutations.
-- Real public/native Qualification and cold replay for SQLite and filesystem/Git.
-- S2 opens only exact admitted bytes without development-checkout imports.
-
-## 7. Wrong vs Correct
-
-Wrong:
-
-```text
-Builder -> self-authored tests -> package -> release
-```
-
-Correct:
-
-```text
-Builder + mutually blind semantic/verifier artifacts
--> Host physical agreement/negatives
--> strict receipt
--> immutable v2 release
-```
+- Need wrapping equivalence and parent-workspace immutability;
+- actor/state input and digest mutations;
+- public versus protected visibility tests;
+- real reset/invoke/persistence/isolation/readback;
+- readback no-mutation and close/reopen stability;
+- filesystem/Git plus SQLite cold relocation;
+- old TaskSemantics/Verifier production references equal zero.

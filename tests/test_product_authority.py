@@ -55,3 +55,49 @@ def test_abandoned_parallel_b_modules_are_deleted() -> None:
         ".trellis/spec/backend/s2-task-specification.md",
     ):
         assert not (ROOT / relative).exists(), relative
+
+
+def test_current_product_authority_separates_s1_environment_from_s2_task_truth() -> None:
+    project = _text(ROOT / "PROJECT.md")
+    s1 = project.split("## S1 owns the executable environment", 1)[1].split(
+        "## S2 owns sampling good Tasks", 1
+    )[0]
+    s2 = project.split("## S2 owns sampling good Tasks", 1)[1].split(
+        "## S3 owns verified policy Episodes", 1
+    )[0]
+
+    for prohibited in (
+        "CapabilitySpecs",
+        "TaskSemantics",
+        "task-specific auditors",
+        "positive/noop Task cases",
+    ):
+        assert prohibited in s1
+    assert "does not publish CapabilitySpecs" in s1
+    assert "one checker project" in s2.casefold()
+    assert "failed task candidate never invalidates" in s2.casefold()
+
+
+def test_current_backend_specs_expose_only_v3_environment_authority() -> None:
+    backend = ROOT / ".trellis/spec/backend"
+    assert not (backend / "v2-preparation.md").exists()
+    assert not (backend / "v2-qualification-publication.md").exists()
+
+    index = _text(backend / "index.md")
+    coordinator = _text(backend / "s1-coordinator.md")
+    preparation = _text(backend / "v3-preparation.md")
+    publication = _text(backend / "v3-conformance-publication.md")
+    normalized_coordinator = " ".join(coordinator.split())
+    normalized_preparation = " ".join(preparation.split())
+
+    assert "./v3-preparation.md" in index
+    assert "./v3-conformance-publication.md" in index
+    assert (
+        "S1 publishes an executable world; it does not generate or qualify Tasks"
+        in normalized_coordinator
+    )
+    assert (
+        "does not generate Tasks or install a release-local semantics/verifier"
+        in normalized_preparation
+    )
+    assert "TaskSemantics" in publication and "rejected as prohibited members" in publication

@@ -12,7 +12,7 @@
   "assignee": "kelong",
   "createdAt": "2026-09-02",
   "completedAt": null,
-  "branch": null,
+  "branch": "s1-s2-authority-realignment",
   "base_branch": "batch-env-task-experiment",
   "worktree_path": null,
   "commit": null,

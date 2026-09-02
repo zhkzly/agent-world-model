@@ -229,3 +229,9 @@ so it was removed before any Release; logical disagreements remain terminal.
 The unchanged AnswerField source validator now runs while the Semantics Author
 still has correction authority and again at final Qualification. The old
 Qualification-local copy was deleted; no source rule or admission gate changed.
+
+`s1-s2-realignment-cp-a|介入0|返工1|authority docs+v3 contract RED/green+5 mutation licences|红线违反0`
+
+Checkpoint A changes product/spec authority and adds an unexported pure v3
+descriptor contract only. Public release/generation/preparation behavior stays
+v2 until the atomic Checkpoint C cutover; no compatibility reader was added.
