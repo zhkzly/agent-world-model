@@ -15,6 +15,11 @@ from typing import Any
 import rfc8785
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
+from agent_env_foundry.physical_runtime import (
+    PreparationSettings,
+    ProjectMaterializationInput,
+    read_actor_tool_catalog,
+)
 from agent_env_foundry.project_identity import (
     ProjectIdentityError,
     compute_authored_project_digest,
@@ -50,6 +55,11 @@ RESET_OBSERVATION_SCHEMA_PATH = Path("docs/schemas/reset.json")
 STATE_SCHEMA_PATH = Path("docs/schemas/state.json")
 _CODEX_PROVIDER_ID = "foundry_runtime"
 _AMBIENT_PYTHON_ENV = ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME")
+_ACTOR_FORBIDDEN_MODULES = (
+    "agent_env_foundry",
+    "generated_task_semantics",
+    "generated_qualification_verifier",
+)
 
 
 class BuilderFailure(RuntimeError):
@@ -294,6 +304,9 @@ def run_candidate_checks(root: Path, config: BuilderConfig) -> tuple[CommandResu
     if not tests_result.passed:
         return tuple(results)
     results.append(_public_contract_check(root))
+    if not results[-1].passed:
+        return tuple(results)
+    results.append(_live_actor_contract_check(root, config))
     return tuple(results)
 
 
@@ -332,6 +345,54 @@ def _public_contract_check(root: Path) -> CommandResult:
         1 if failures else 0,
         "" if failures else "public contract passed",
         json.dumps(failures, ensure_ascii=False, sort_keys=True) if failures else "",
+    )
+
+
+def _live_actor_contract_check(root: Path, config: BuilderConfig) -> CommandResult:
+    """Run the exact Host ToolSpec decoder while the Builder can still repair."""
+
+    try:
+        digest = compute_candidate_digest(root)
+        tools = read_actor_tool_catalog(
+            ProjectMaterializationInput(
+                root,
+                digest,
+                "generated_environment",
+                _ACTOR_FORBIDDEN_MODULES,
+                "actor",
+            ),
+            root.parent / ".builder-contract-runtimes" / digest,
+            factory=ACTOR_FACTORY,
+            settings=PreparationSettings(
+                config.uv_cache_dir,
+                config.command_timeout_seconds,
+            ),
+        )
+    except Exception as exc:
+        details = getattr(exc, "details", {})
+        failure = {
+            "error_type": type(exc).__name__,
+            "code": getattr(exc, "code", "live_actor_contract_failed"),
+            "message": str(exc),
+            "details": details if isinstance(details, dict) else {"value": details},
+        }
+        return CommandResult(
+            "live_contract",
+            ("host", "validate-live-actor-contract"),
+            1,
+            "",
+            json.dumps(failure, ensure_ascii=False, sort_keys=True, default=str),
+        )
+    return CommandResult(
+        "live_contract",
+        ("host", "validate-live-actor-contract"),
+        0,
+        json.dumps(
+            {"tool_names": [item["name"] for item in tools]},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        "",
     )
 
 

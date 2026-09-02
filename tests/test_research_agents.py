@@ -199,7 +199,7 @@ def test_responses_loop_resends_unmodified_output_items_and_matching_tool_output
             {"queries": [{"query": "unfamiliar workflow", "focus": "NEED-001"}]},
         )
     ]
-    assert factory_calls == [(secret, "http://127.0.0.1:8317/v1", 2)]
+    assert factory_calls == [(secret, "http://127.0.0.1:8317/v1", 0)]
     first, second = client.responses.calls
     assert first["model"] == "gpt-5.6-luna"
     assert first["store"] is False
@@ -358,6 +358,26 @@ def test_route_has_no_persistable_credential_field() -> None:
     assert "api_key" not in document
 
 
+def test_default_responses_client_has_a_bounded_turn_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_openai(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(agents_module, "OpenAI", fake_openai)
+    agents_module._default_client_factory(
+        api_key="invocation-only-secret",
+        base_url="http://127.0.0.1:8317/v1",
+        max_retries=0,
+    )
+
+    assert captured["timeout"] == 180.0
+    assert captured["max_retries"] == 0
+
+
 def test_missing_invocation_credential_is_typed_and_secret_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -417,7 +437,7 @@ def test_fresh_evidence_reviewer_receives_only_need_bounded_evidence_and_brief(
     review = reviewer.review(need=need, brief=_brief())
 
     assert review.clause_findings[0]["judgment"] == "supported"
-    assert factory_calls == [("reviewer-secret", "http://127.0.0.1:8317/v1", 2)]
+    assert factory_calls == [("reviewer-secret", "http://127.0.0.1:8317/v1", 0)]
     assert len(client.responses.calls) == 1
     request = client.responses.calls[0]
     rendered_input = repr(request["input"])

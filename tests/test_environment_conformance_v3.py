@@ -7,6 +7,7 @@ import pytest
 
 from agent_env_foundry.builder import CandidateBuild, CommandResult
 from agent_env_foundry.environment_conformance_v3 import (
+    _replay_projection,
     run_environment_conformance_v3_internal,
 )
 from agent_env_foundry.preparation_v3 import (
@@ -27,7 +28,14 @@ def _settings() -> PreparationSettingsV3:
 def _candidate(root: Path, *, phases: tuple[str, ...] | None = None) -> CandidateBuild:
     actor = build_actor_project(root)
     digest = compute_authored_project_digest(actor, "actor", require_locked_project=True)
-    selected = phases or ("lock", "sync", "build", "tests", "public_contract")
+    selected = phases or (
+        "lock",
+        "sync",
+        "build",
+        "tests",
+        "public_contract",
+        "live_contract",
+    )
     checks = tuple(CommandResult(phase, ("physical", phase), 0, "passed", "") for phase in selected)
     return CandidateBuild(actor, "fixture-thread", digest, "fixture", checks)
 
@@ -58,3 +66,20 @@ def test_v3_conformance_rejects_incomplete_builder_evidence(tmp_path: Path) -> N
             settings=_settings(),
         )
     assert caught.value.code == "builder_evidence_incomplete"
+
+
+def test_replay_projection_normalizes_only_the_host_instance_locator(tmp_path: Path) -> None:
+    instance = tmp_path / "instance-a"
+    value = {
+        "root": str(instance),
+        "file": str(instance / "src/app.py"),
+        "similar_but_external": str(tmp_path / "instance-ab/file.txt"),
+        "nested": [str(instance / "README.md"), 3],
+    }
+
+    assert _replay_projection(value, instance) == {
+        "root": "<INSTANCE_ROOT>",
+        "file": "<INSTANCE_ROOT>/src/app.py",
+        "similar_but_external": str(tmp_path / "instance-ab/file.txt"),
+        "nested": ["<INSTANCE_ROOT>/README.md", 3],
+    }

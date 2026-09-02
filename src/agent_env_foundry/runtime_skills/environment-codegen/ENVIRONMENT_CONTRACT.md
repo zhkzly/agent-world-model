@@ -38,6 +38,10 @@ failure: {"ok": false, "data": null,
           "error": {"code": str, "message": str, "details"?: JSON}}
 ```
 
+`output_schema` describes only the value inside a successful observation's
+`data` field. It must never describe or repeat the outer `{ok,data,error}`
+ToolObservation envelope; that envelope is fixed and validated by the Host.
+
 Tool outputs must be structured and machine-addressable so a returned value can
 be passed to a later tool. Do not hide identifiers or state facts in prose.
 Every emitted public leaf in a reset result or successful ToolObservation
@@ -100,8 +104,15 @@ Include meaningful package data, diagnostic tests, `uv.lock`, and all declared
 dependencies. Tests must exercise multi-step state changes and a refusal with no
 prohibited mutation. The diagnostic matrix must execute every public tool at
 least once on a representative real success or refusal and validate the full
-returned envelope against that tool's exact ToolSpec; checking selected business
-fields without schema validation is insufficient. A dictionary response map,
+returned envelope against the fixed ToolObservation rules. For a success,
+validate `observation["data"]` against the exact ToolSpec's `output_schema`; for a
+refusal, validate the fixed error shape. Checking selected business fields
+without schema validation is insufficient. A dictionary response map,
 canned result, mock backend, empty world, repository template, Task, verifier,
 reward, trajectory, MCP, HTTP, or training-specific behavior does not satisfy
 this contract.
+
+For native identifiers and state projections, tests must compare the structured
+value with independent backend truth (for example the actual database row,
+filesystem bytes, or native command result). Schema self-validation and
+round-tripping the same parser do not prove that an identifier is exact.

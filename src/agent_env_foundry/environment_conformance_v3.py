@@ -36,7 +36,14 @@ from agent_env_foundry.schema import (
     validate_schema_document,
 )
 
-_EXPECTED_BUILDER_PHASES = ("lock", "sync", "build", "tests", "public_contract")
+_EXPECTED_BUILDER_PHASES = (
+    "lock",
+    "sync",
+    "build",
+    "tests",
+    "public_contract",
+    "live_contract",
+)
 _FORBIDDEN_ACTOR_MODULES = (
     "agent_env_foundry",
     "generated_task_semantics",
@@ -113,9 +120,11 @@ def run_environment_conformance_v3_internal(
         )
     reset_b, tools_b = _reset_candidate(runtime, instance_b, start, reset, settings)
     state_b, state_b_events = _read_candidate_state(runtime, instance_b, state, settings)
-    if canonical_bytes(reset_a) != canonical_bytes(reset_b) or canonical_bytes(
-        state_a
-    ) != canonical_bytes(state_b):
+    if canonical_bytes(_replay_projection(reset_a, instance_a)) != canonical_bytes(
+        _replay_projection(reset_b, instance_b)
+    ) or canonical_bytes(_replay_projection(state_a, instance_a)) != canonical_bytes(
+        _replay_projection(state_b, instance_b)
+    ):
         raise PreparationExecutionError(
             "EnvironmentDefect",
             "reset_replay_drift",
@@ -156,6 +165,7 @@ def run_environment_conformance_v3_internal(
             ),
             "reopen_persistence": True,
             "controlled_reset_replay": True,
+            "replay_projection": "instance-root-token/1",
             "instance_isolation": True,
         },
     }
@@ -189,6 +199,24 @@ def _schema(
             "EnvironmentDefect", "actor_schema_invalid", str(exc), path=str(path)
         ) from exc
     return cast(JSONObject, document)
+
+
+def _replay_projection(value: JSONValue, instance_root: Path) -> JSONValue:
+    """Remove only the Host-assigned instance locator from cross-instance comparison."""
+
+    root = str(instance_root.resolve())
+    if isinstance(value, str):
+        if value == root:
+            return "<INSTANCE_ROOT>"
+        prefix = root + "/"
+        if value.startswith(prefix):
+            return "<INSTANCE_ROOT>/" + value[len(prefix) :]
+        return value
+    if isinstance(value, list):
+        return [_replay_projection(item, instance_root) for item in value]
+    if isinstance(value, dict):
+        return {key: _replay_projection(item, instance_root) for key, item in value.items()}
+    return value
 
 
 def _reset_candidate(

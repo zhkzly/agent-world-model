@@ -145,6 +145,65 @@ def test_validate_tool_catalog_builds_name_index() -> None:
     assert index["t"] == OK_SPEC
 
 
+def test_validate_tool_catalog_canonicalizes_missing_input_object_root() -> None:
+    raw = make_spec(
+        input_schema={
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+    )
+
+    normalized = validate_tool_catalog((raw,))["t"]
+
+    assert normalized["input_schema"] == {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    }
+    assert "type" not in raw["input_schema"]
+
+
+def test_validate_tool_catalog_extracts_exact_wrapped_success_data_schema() -> None:
+    data_schema = {
+        "type": "object",
+        "properties": {"count": {"type": "integer"}},
+        "required": ["count"],
+    }
+    wrapped = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {"detail": {"type": "string"}},
+        "anyOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "ok": {"const": True},
+                    "data": data_schema,
+                    "error": {"type": "null"},
+                },
+                "required": ["ok", "data", "error"],
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "ok": {"const": False},
+                    "data": {"type": "null"},
+                    "error": {"type": "object"},
+                },
+                "required": ["ok", "data", "error"],
+            },
+        ],
+    }
+
+    normalized = validate_tool_catalog((make_spec(output_schema=wrapped),))["t"]
+
+    assert normalized["output_schema"] == {
+        **data_schema,
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {"detail": {"type": "string"}},
+    }
+    assert "anyOf" in wrapped
+
+
 @pytest.mark.parametrize(
     "specs",
     [

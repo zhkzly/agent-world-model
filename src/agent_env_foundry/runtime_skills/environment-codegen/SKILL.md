@@ -39,8 +39,13 @@ input file.
    absence of complete query-answer leakage from reset. Tests must also prove
    `read_state` schema conformance, deterministic repeated reads and no mutation.
    For every public tool, execute at least one representative real observation
-   and validate its complete success or refusal envelope against that exact
-   ToolSpec; business assertions alone do not prove schema conformance.
+   and validate its fixed success/refusal envelope. On success, validate only
+   `observation["data"]` against that ToolSpec's `output_schema`; never wrap the
+   fixed `{ok,data,error}` envelope inside `output_schema`. Business assertions
+   alone do not prove schema conformance.
+   Cross-check native identifiers and protected state against independent
+   backend truth; never prove a parser correct only by round-tripping its own
+   output or by checking that the result is a string.
 7. Declare and lock every runtime and test dependency yourself in the project's
    `pyproject.toml` and `uv.lock` (test tools such as a test runner belong in a
    dev dependency group). Install and run through the project's own uv

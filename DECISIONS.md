@@ -251,3 +251,13 @@ audit rejected a copied 735-line preparation implementation; task-neutral uv,
 child transport, Actor proxy and protected snapshot behavior now exist once in
 `physical_runtime.py`, while an isolated-process import test proves the v3
 coordinator loads no old semantics, Qualification, Verifier or Task module.
+
+`s1-s2-realignment-cp-d|介入1|返工3|real Git+SQLite Releases+native truth/reopen/refusal proof+5 mutation licences+543 full tests|红线违反0`
+
+Checkpoint D produced two contrasting cold Release IDs and retained earlier
+failed artifacts instead of counting them. Live evidence moved only uniquely
+determined ABI/exogenous corrections into Framework: missing input object root,
+an exact ToolObservation wrapper around `output_schema`, and Host-assigned
+instance-root replay projection. A malformed native Git history identifier was
+not normalized by Framework; Codex repaired the actor and added independent Git
+truth tests. No Task, checker, reward or domain branch entered S1.

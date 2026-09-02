@@ -38,6 +38,8 @@ from agent_env_foundry.research import (
     validate_evidence_review,
 )
 
+_PROVIDER_TURN_TIMEOUT_SECONDS = 180.0
+
 __all__ = [
     "AgentRoute",
     "BriefEvidenceReviewer",
@@ -135,7 +137,12 @@ def load_research_skill() -> ResearchSkill:
 def _default_client_factory(*, api_key: str, base_url: str, max_retries: int) -> _ResponsesClient:
     return cast(
         _ResponsesClient,
-        OpenAI(api_key=api_key, base_url=base_url, max_retries=max_retries),
+        OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=max_retries,
+            timeout=_PROVIDER_TURN_TIMEOUT_SECONDS,
+        ),
     )
 
 
@@ -613,7 +620,7 @@ def _run_tool_json_loop(
                 },
             )
     credential = _credential()
-    client = client_factory(api_key=credential, base_url=route.base_url, max_retries=2)
+    client = client_factory(api_key=credential, base_url=route.base_url, max_retries=0)
     history: list[Any] = [{"role": "user", "content": input_text}]
     next_phase = "agent"
     next_original_code = "budget_exhausted"
@@ -827,7 +834,7 @@ def _run_fresh_json_turn(
     ),
 ) -> dict[str, Any]:
     credential = _credential()
-    client = client_factory(api_key=credential, base_url=route.base_url, max_retries=2)
+    client = client_factory(api_key=credential, base_url=route.base_url, max_retries=0)
     history: list[Any] = [{"role": "user", "content": input_text}]
     next_original_code = "budget_exhausted"
     next_original_message = "no provider turns remaining"

@@ -23,6 +23,7 @@ from agent_env_foundry.builder import (
     run_candidate_checks,
 )
 from agent_env_foundry.research import BuilderProjection
+from v3_release_factory import build_actor_project
 
 
 @pytest.fixture(autouse=True)
@@ -498,6 +499,17 @@ def _wire_fake_toolchain(
     monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "ambient-venv"))
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "ambient-site-packages"))
     monkeypatch.setenv("PYTHONHOME", str(tmp_path / "ambient-pythonhome"))
+    monkeypatch.setattr(
+        builder_module,
+        "_live_actor_contract_check",
+        lambda _root, _config: CommandResult(
+            "live_contract",
+            ("host", "validate-live-actor-contract"),
+            0,
+            "passed",
+            "",
+        ),
+    )
     return log
 
 
@@ -531,6 +543,7 @@ def test_host_preparation_owns_installation_and_scrubs_ambient_python_env(
         "build",
         "tests",
         "public_contract",
+        "live_contract",
     ]
     lines = log.read_text().splitlines()
     argv = [line for line in lines if line.startswith("ARGV:")]
@@ -591,6 +604,50 @@ def test_candidate_checks_reject_noncanonical_schema_handoff_paths(
     assert "docs/schemas/state.json" in public_contract.stderr
 
 
+def test_live_actor_contract_canonicalizes_missing_input_root_before_conformance(
+    tmp_path: Path,
+) -> None:
+    root = build_actor_project(tmp_path / "candidate")
+    release_source = root / "src/generated_environment/release.py"
+    source = release_source.read_text(encoding="utf-8")
+    release_source.write_text(
+        source.replace(
+            '"type": "object",\n                    "properties": {"amount"',
+            '"properties": {"amount"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    result = builder_module._live_actor_contract_check(
+        root,
+        BuilderConfig(uv_cache_dir=tmp_path / "uv-cache"),
+    )
+
+    assert result.phase == "live_contract"
+    assert result.passed
+    assert json.loads(result.stdout) == {"tool_names": ["increment"]}
+
+
+def test_live_actor_contract_rejects_conflicting_input_root(tmp_path: Path) -> None:
+    root = build_actor_project(tmp_path / "candidate")
+    release_source = root / "src/generated_environment/release.py"
+    source = release_source.read_text(encoding="utf-8")
+    release_source.write_text(
+        source.replace('"type": "object"', '"type": "array"', 1),
+        encoding="utf-8",
+    )
+
+    result = builder_module._live_actor_contract_check(
+        root,
+        BuilderConfig(uv_cache_dir=tmp_path / "uv-cache"),
+    )
+
+    assert not result.passed
+    failure = json.loads(result.stderr)
+    assert 'root "type": "object"' in failure["message"]
+
+
 _CONTRACT_PATH = (
     Path(__file__).resolve().parents[1]
     / "src/agent_env_foundry/runtime_skills/environment-codegen/ENVIRONMENT_CONTRACT.md"
@@ -614,6 +671,9 @@ def test_contract_document_keeps_release_assembly_out_of_builder() -> None:
     assert "`docs/schemas/reset.json`" in text
     assert "`docs/schemas/state.json`" in text
     assert "task-neutral" in text
+    assert "describes only the value inside a successful observation" in text
+    assert "must never describe or repeat the outer" in text
+    assert "independent backend truth" in text
     assert "execute every public tool" in text
     assert "exact ToolSpec" in text
     assert "Do not write `release.json`" in text
@@ -623,8 +683,9 @@ def test_contract_document_keeps_release_assembly_out_of_builder() -> None:
 def test_environment_codegen_skill_requires_complete_tool_schema_matrix() -> None:
     text = " ".join(_SKILL_PATH.read_text(encoding="utf-8").split())
     assert "For every public tool" in text
-    assert "complete success or refusal envelope" in text
-    assert "against that exact ToolSpec" in text
+    assert "fixed success/refusal envelope" in text
+    assert 'observation["data"]' in text
+    assert "that ToolSpec's `output_schema`" in text
     assert "read_state" in text and "task-neutral" in text
 
 

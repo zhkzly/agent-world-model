@@ -155,15 +155,61 @@ def validate_tool_catalog(specs: Any, *, role: str = "tools()") -> dict[str, Too
             raise EnvironmentRuntimeError(
                 f"{role} entry {position} ({name!r}) description must be a string"
             )
+        input_schema = spec["input_schema"]
+        if isinstance(input_schema, dict) and "type" not in input_schema:
+            input_schema = {"type": "object", **input_schema}
+        output_schema = _canonical_output_schema(spec["output_schema"])
         try:
-            require_object_root(spec["input_schema"], role=f"tool {name!r} input_schema")
-            validate_schema_document(spec["output_schema"], role=f"tool {name!r} output_schema")
+            require_object_root(input_schema, role=f"tool {name!r} input_schema")
+            validate_schema_document(output_schema, role=f"tool {name!r} output_schema")
         except SchemaError as exc:
             raise EnvironmentRuntimeError(f"{role} entry {position} is invalid: {exc}") from exc
         if name in index:
             raise EnvironmentRuntimeError(f"{role} declares duplicate tool name {name!r}")
-        index[name] = cast(ToolSpec, spec)
+        normalized = dict(spec)
+        normalized["input_schema"] = input_schema
+        normalized["output_schema"] = output_schema
+        index[name] = cast(ToolSpec, normalized)
     return index
+
+
+def _canonical_output_schema(schema: Any) -> Any:
+    """Extract success data from an exact, mistakenly wrapped ToolObservation schema."""
+
+    if not isinstance(schema, dict):
+        return schema
+    variants = schema.get("anyOf")
+    if not isinstance(variants, list) or len(variants) != 2:
+        return schema
+    success: dict[str, Any] | None = None
+    failure: dict[str, Any] | None = None
+    for variant in variants:
+        if not isinstance(variant, dict):
+            return schema
+        properties = variant.get("properties")
+        required = variant.get("required")
+        if (
+            not isinstance(properties, dict)
+            or set(properties) != {"ok", "data", "error"}
+            or not isinstance(required, list)
+            or set(required) != {"ok", "data", "error"}
+        ):
+            return schema
+        ok_schema = properties.get("ok")
+        if ok_schema == {"const": True} and properties.get("error") == {"type": "null"}:
+            success = variant
+        elif ok_schema == {"const": False} and properties.get("data") == {"type": "null"}:
+            failure = variant
+    if success is None or failure is None:
+        return schema
+    data_schema = cast(dict[str, Any], success["properties"])["data"]
+    if not isinstance(data_schema, dict):
+        return schema
+    normalized = dict(data_schema)
+    for keyword in ("$schema", "$defs"):
+        if keyword in schema and keyword not in normalized:
+            normalized[keyword] = schema[keyword]
+    return normalized
 
 
 def validate_observation(
