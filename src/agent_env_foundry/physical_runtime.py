@@ -37,20 +37,16 @@ from agent_env_foundry.tree_manifest import tree_manifest
 PreparationFailureKind = Literal[
     "EnvironmentDefect",
     "InfrastructureFailure",
-    "SemanticsDefect",
-    "VerifierDefect",
     "CheckerDefect",
 ]
 _PREPARATION_FAILURE_KINDS = frozenset(
     {
         "EnvironmentDefect",
         "InfrastructureFailure",
-        "SemanticsDefect",
-        "VerifierDefect",
         "CheckerDefect",
     }
 )
-_PROJECT_ROLES = frozenset({"actor", "semantics", "verifier", "checker"})
+_PROJECT_ROLES = frozenset({"actor", "checker"})
 
 
 class PreparationContractError(ValueError):
@@ -162,7 +158,7 @@ class _ChildTransport:
         *,
         cwd: Path,
         timeout: float,
-        role: Literal["actor", "semantics", "checker"],
+        role: Literal["actor", "checker"],
     ) -> None:
         environment = dict(os.environ)
         for name in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
@@ -618,18 +614,12 @@ def _project_source_digest(project: Path, role: ProjectRole) -> str:
 def _role_defect(role: ProjectRole) -> PreparationFailureKind:
     if role == "actor":
         return "EnvironmentDefect"
-    if role == "semantics":
-        return "SemanticsDefect"
-    if role == "verifier":
-        return "VerifierDefect"
     return "CheckerDefect"
 
 
-def _child_defect(role: Literal["actor", "semantics", "checker"]) -> PreparationFailureKind:
+def _child_defect(role: Literal["actor", "checker"]) -> PreparationFailureKind:
     if role == "actor":
         return "EnvironmentDefect"
-    if role == "semantics":
-        return "SemanticsDefect"
     return "CheckerDefect"
 
 

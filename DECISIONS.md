@@ -299,3 +299,10 @@ reverted intact. The replacement uses one universal path—executed proposal,
 checker sanity and two fresh public solves—and emits no challenge categories.
 Old ForEach/If, batch/assessment and Episode product code was deleted before
 further feature work; the retained canary artifacts remain diagnostic only.
+
+`s1-s2-old-authority-deletion|介入0|返工0|v2/semantics/verifier零引用+351 tests+release mutation licence|红线违反0`
+
+Only EnvironmentRelease/3 and the Direct Task sampler remain as product
+authority. Shared canonical ZIP/hash/path helpers survive without a v2 reader,
+descriptor, publisher or compatibility switch; actor/checker are the only
+authored project roles.

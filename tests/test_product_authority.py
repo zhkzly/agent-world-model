@@ -49,18 +49,53 @@ def test_archived_task_and_context_select_only_the_direct_product_path() -> None
 
 def test_abandoned_parallel_b_modules_are_deleted() -> None:
     for relative in (
+        "src/agent_env_foundry/_semantics_runner.py",
+        "src/agent_env_foundry/answer_sources.py",
+        "src/agent_env_foundry/author_finding.py",
+        "src/agent_env_foundry/frozen_inputs.py",
+        "src/agent_env_foundry/generation.py",
+        "src/agent_env_foundry/preparation.py",
+        "src/agent_env_foundry/provenance.py",
+        "src/agent_env_foundry/qualification_contracts.py",
+        "src/agent_env_foundry/qualification_runner.py",
+        "src/agent_env_foundry/qualification_v2.py",
         "src/agent_env_foundry/requirement_obligations.py",
+        "src/agent_env_foundry/semantics.py",
+        "src/agent_env_foundry/semantics_author.py",
+        "src/agent_env_foundry/semantics_authoring.py",
+        "src/agent_env_foundry/semantics_inputs.py",
+        "src/agent_env_foundry/semantics_wire.py",
+        "src/agent_env_foundry/task_execution.py",
+        "src/agent_env_foundry/task_foundry.py",
         "src/agent_env_foundry/task_specification.py",
         "src/agent_env_foundry/task_binding.py",
+        "src/agent_env_foundry/verifier_author.py",
+        "src/agent_env_foundry/verifier_inputs.py",
         "src/agent_env_foundry/assessment.py",
         "src/agent_env_foundry/batch_foundry.py",
         "src/agent_env_foundry/episode_batch.py",
         "src/agent_env_foundry/episode_runtime.py",
         "src/agent_env_foundry/foreach_foundry.py",
         "src/agent_env_foundry/if_foundry.py",
+        "src/agent_env_foundry/runtime_skills/qualification-verifier-codegen",
+        "src/agent_env_foundry/runtime_skills/task-semantics-codegen",
         ".trellis/spec/backend/s2-task-specification.md",
     ):
         assert not (ROOT / relative).exists(), relative
+
+
+def test_current_release_support_exports_no_v2_product_api() -> None:
+    release = _text(ROOT / "src/agent_env_foundry/release.py")
+    for obsolete in (
+        "DESCRIPTOR_FORMAT_V2",
+        "ReleaseDescriptorV2",
+        "ValidatedReleaseV2",
+        "parse_descriptor_v2",
+        "publish_release_v2",
+        "verify_release_v2",
+        "write_release_zip_v2",
+    ):
+        assert obsolete not in release
 
 
 def test_current_product_authority_separates_s1_environment_from_s2_task_truth() -> None:

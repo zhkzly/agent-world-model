@@ -31,7 +31,6 @@ from agent_env_foundry.episodes import (
 )
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
 from agent_env_foundry.schema import SchemaError, validate_instance
-from agent_env_foundry.semantics import TraceEvent
 
 PublicAgentFailureKind = Literal["EnvironmentDefect", "InfrastructureFailure", "NoPublicWitness"]
 type _DriverCall = tuple[JSONValue, JSONValue, JSONValue]
@@ -103,6 +102,22 @@ class DriverDecision:
     defect: EpisodeDefect | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PublicTraceEvent:
+    seq: int
+    tool_name: str
+    arguments: JSONObject
+    observation: JSONObject
+
+    def to_document(self) -> JSONObject:
+        return {
+            "seq": self.seq,
+            "tool_name": self.tool_name,
+            "arguments": _object(self.arguments, "trace arguments"),
+            "observation": _object(self.observation, "trace observation"),
+        }
+
+
 class PolicyDriver(Protocol):
     @property
     def policy_spec(self) -> PolicySpec: ...
@@ -118,7 +133,7 @@ class PolicyDriver(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class PublicEpisodeRun:
-    trace: tuple[TraceEvent, ...]
+    trace: tuple[PublicTraceEvent, ...]
     final_answer: JSONObject
     provider_turns: int
     usage: tuple[JSONObject | None, ...]
@@ -499,7 +514,7 @@ def _capture(
     )
 
 
-def _trace_from_capture(capture: PublicEpisodeCapture) -> tuple[TraceEvent, ...]:
+def _trace_from_capture(capture: PublicEpisodeCapture) -> tuple[PublicTraceEvent, ...]:
     dispatched = (
         call
         for turn in capture.turns
@@ -507,7 +522,7 @@ def _trace_from_capture(capture: PublicEpisodeCapture) -> tuple[TraceEvent, ...]
         if call.dispatch_status == "dispatched"
     )
     return tuple(
-        TraceEvent(
+        PublicTraceEvent(
             seq,
             cast(str, call.tool_name),
             _object(call.parsed_arguments, "trace arguments"),
@@ -900,6 +915,7 @@ __all__ = [
     "PolicyDriver",
     "PublicAgentFailure",
     "PublicEpisodeRun",
+    "PublicTraceEvent",
     "ResponsesPolicyDriver",
     "UnattributedPolicyDriverFailure",
     "capture_public_episode",

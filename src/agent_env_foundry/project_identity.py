@@ -11,7 +11,7 @@ from typing import Any, Literal, cast
 
 import rfc8785
 
-ProjectRole = Literal["actor", "semantics", "verifier", "checker"]
+ProjectRole = Literal["actor", "checker"]
 
 _COMMON_EXCLUDED_PARTS = frozenset(
     {
@@ -26,29 +26,10 @@ _COMMON_EXCLUDED_PARTS = frozenset(
 )
 _ROLE_EXCLUDED_PARTS: dict[ProjectRole, frozenset[str]] = {
     "actor": frozenset(),
-    "semantics": frozenset({"candidate-view"}),
-    "verifier": frozenset({"actor-view"}),
     "checker": frozenset(),
 }
 _ROLE_EXCLUDED_NAMES: dict[ProjectRole, frozenset[str]] = {
     "actor": frozenset({"BUILDER_PROJECTION.json", "ENVIRONMENT_CONTRACT.md"}),
-    "semantics": frozenset(
-        {
-            "EXPECTED_TASK_SEMANTICS.json",
-            "PUBLIC_SURFACE.json",
-            "TASK_SEMANTICS_CONTRACT.md",
-            "TASK_SEMANTICS_WIRE.json",
-            "CANDIDATE_VIEW_MANIFEST.json",
-        }
-    ),
-    "verifier": frozenset(
-        {
-            "EXPECTED_TASK_SEMANTICS.json",
-            "PUBLIC_SURFACE.json",
-            "QUALIFICATION_VERIFIER_CONTRACT.md",
-            "ACTOR_VIEW_MANIFEST.json",
-        }
-    ),
     "checker": frozenset(
         {
             "CANDIDATE_TASK_CONTRACT.json",

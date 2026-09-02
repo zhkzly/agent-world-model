@@ -23,8 +23,7 @@ type DefectOwner = Literal[
     "infrastructure",
     "environment",
     "task_artifact",
-    "semantics",
-    "verifier",
+    "checker",
     "evidence",
 ]
 type _CompletionKind = Literal["completed", "policy_failure"]
@@ -36,8 +35,7 @@ _DEFECT_OWNERS = frozenset(
         "infrastructure",
         "environment",
         "task_artifact",
-        "semantics",
-        "verifier",
+        "checker",
         "evidence",
     }
 )

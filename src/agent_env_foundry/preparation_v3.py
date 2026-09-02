@@ -40,11 +40,7 @@ from agent_env_foundry.release import canonical_bytes, safe_member_path, sha256_
 from agent_env_foundry.release_v3 import ValidatedReleaseV3, verify_release_v3_internal
 from agent_env_foundry.release_v3_contract import DESCRIPTOR_FORMAT_V3
 
-_FORBIDDEN_ACTOR_MODULES = (
-    "agent_env_foundry",
-    "generated_task_semantics",
-    "generated_qualification_verifier",
-)
+_FORBIDDEN_ACTOR_MODULES = ("agent_env_foundry",)
 
 
 @dataclass(frozen=True, slots=True)

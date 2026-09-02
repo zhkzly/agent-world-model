@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from agent_env_foundry.preparation import (
+from agent_env_foundry.physical_runtime import (
     PreparationExecutionError,
     StateSnapshotProxy,
 )

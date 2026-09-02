@@ -50,8 +50,6 @@ _FORBIDDEN_IMPORTS = frozenset(
     {
         "agent_env_foundry",
         "generated_environment",
-        "generated_qualification_verifier",
-        "generated_task_semantics",
         "httpx",
         "openai",
         "os",
@@ -257,8 +255,6 @@ def execute_task_checker(
             (
                 "agent_env_foundry",
                 "generated_environment",
-                "generated_task_semantics",
-                "generated_qualification_verifier",
             ),
             "checker",
         ),

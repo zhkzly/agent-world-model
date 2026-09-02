@@ -370,8 +370,7 @@ def test_defect_owner_set_is_closed_and_provider_is_not_infrastructure() -> None
         "infrastructure",
         "environment",
         "task_artifact",
-        "semantics",
-        "verifier",
+        "checker",
         "evidence",
     }
 

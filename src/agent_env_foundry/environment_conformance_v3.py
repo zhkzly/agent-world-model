@@ -52,11 +52,7 @@ _EXPECTED_BUILDER_PHASES = (
     "source_determinism",
     "live_contract",
 )
-_FORBIDDEN_ACTOR_MODULES = (
-    "agent_env_foundry",
-    "generated_task_semantics",
-    "generated_qualification_verifier",
-)
+_FORBIDDEN_ACTOR_MODULES = ("agent_env_foundry",)
 
 
 @dataclass(frozen=True, slots=True)
