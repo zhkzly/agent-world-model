@@ -338,6 +338,9 @@ objective; they never enter the acting-policy view or Task truth.
 Release and Task schemas remain full Draft 2020-12 Host authority. Responses
 tool/answer requests use one shared mechanical projection of that frozen schema:
 all wire-visible object fields are required, objects are closed, and unsupported
-wire-only constraints are omitted. The exact model result is still validated
+wire-only constraints are omitted. `contains` supplies `items` when possible;
+a genuinely untyped array is returned to the Proposal Agent before checker
+construction. A 26-Candidate/29-ToolSpec preflight found exactly the two known
+bare arrays and no further wire-shape failure. The exact model result is still validated
 against the original schema, so the adapter cannot turn an invalid answer into a
 passing Task.

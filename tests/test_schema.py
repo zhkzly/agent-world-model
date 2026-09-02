@@ -161,6 +161,15 @@ def test_responses_projection_closes_objects_and_removes_unsupported_constraints
                 "additionalProperties": True,
                 "dependentRequired": {"id": ["tags"]},
             },
+            "members": {
+                "type": "array",
+                "contains": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                    "additionalProperties": True,
+                },
+            },
         },
         "required": ["record"],
         "additionalProperties": True,
@@ -172,7 +181,7 @@ def test_responses_projection_closes_objects_and_removes_unsupported_constraints
 
     assert set(projected) == {"type", "properties", "required", "additionalProperties"}
     assert projected["additionalProperties"] is False
-    assert projected["required"] == ["not", "record"]
+    assert projected["required"] == ["not", "record", "members"]
     assert "not" in projected["properties"]
     record = projected["properties"]["record"]
     assert record["additionalProperties"] is False
@@ -181,5 +190,21 @@ def test_responses_projection_closes_objects_and_removes_unsupported_constraints
     tags = record["properties"]["tags"]
     assert "uniqueItems" not in tags
     assert tags["minItems"] == 1
+    members = projected["properties"]["members"]
+    assert "contains" not in members
+    assert members["items"]["additionalProperties"] is False
+    assert members["items"]["required"] == ["id"]
     assert source["properties"]["record"]["additionalProperties"] is True
     assert source["properties"]["record"]["properties"]["tags"]["uniqueItems"] is True
+
+
+def test_responses_projection_rejects_array_without_item_semantics() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"values": {"type": "array"}},
+        "required": ["values"],
+        "additionalProperties": False,
+    }
+
+    with pytest.raises(SchemaError, match="array.*requires items"):
+        project_responses_strict_schema(schema)

@@ -213,6 +213,50 @@ def test_direct_proposal_returns_nested_contract_error_for_same_history_repair(
     assert "final_answer_schema" in repr(client.responses.calls[2]["input"])
 
 
+def test_direct_proposal_repairs_bare_array_schema_before_checker_handoff(tmp_path) -> None:
+    bare_array = {
+        "instruction": "Increment and report the observed values.",
+        "checker_brief": "Require a real increment and the resulting values.",
+        "final_answer_schema_json": json.dumps(
+            {
+                "type": "object",
+                "properties": {"values": {"type": "array"}},
+                "required": ["values"],
+                "additionalProperties": False,
+            }
+        ),
+        "proposed_final_answer_json": json.dumps({"values": [2]}),
+    }
+    client = Client(
+        [
+            Response(
+                [
+                    FunctionCall(
+                        "increment",
+                        {"counter_id": "counter-main", "amount": 2},
+                        "call-1",
+                    )
+                ]
+            ),
+            Response([], json.dumps(bare_array)),
+            Response([], json.dumps(_final())),
+        ]
+    )
+
+    result = propose_task_direct(
+        Prepared(),
+        development_brief={"need": "Maintain a persistent counter."},
+        builder_projection_digest="2" * 64,
+        instance_directory=tmp_path / "instance",
+        route=AgentRoute(),
+        client_factory=lambda **kwargs: client,
+    )
+
+    assert result.provider_turns == 3
+    assert "array" in repr(client.responses.calls[2]["input"])
+    assert "requires items" in repr(client.responses.calls[2]["input"])
+
+
 def test_direct_proposal_rejects_terminal_without_real_public_action(tmp_path) -> None:
     client = Client([Response([], json.dumps(_final()))])
 

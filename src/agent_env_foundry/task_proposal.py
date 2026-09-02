@@ -475,6 +475,12 @@ def _proposal_fields(output_text: str) -> _ProposalFields:
             "0" * 64,
         )
         validate_instance(answer, answer_schema, role="proposed_final_answer")
+        wire_answer_schema = project_responses_strict_schema(answer_schema)
+        validate_instance(
+            answer,
+            wire_answer_schema,
+            role="Responses-compatible proposed_final_answer",
+        )
     except (SchemaError, ValueError) as exc:
         raise ValueError(str(exc)) from exc
     return _ProposalFields(

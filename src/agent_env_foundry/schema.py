@@ -101,7 +101,7 @@ def project_responses_strict_schema(schema: Any) -> dict[str, Any]:
     """
 
     validate_schema_document(schema, role="Responses source")
-    projected = _project_responses_node(schema)
+    projected = _project_responses_node(schema, path="$")
     validate_schema_document(projected, role="Responses projection")
     return projected
 
@@ -144,7 +144,8 @@ def _require_local_references(node: Any, *, role: str) -> None:
         pending.extend(resource.subresources())
 
 
-def _project_responses_node(node: dict[str, Any]) -> dict[str, Any]:
+def _project_responses_node(node: dict[str, Any], *, path: str) -> dict[str, Any]:
+    contains = node.get("contains")
     projected = {
         key: value for key, value in node.items() if key not in _RESPONSES_UNSUPPORTED_KEYS
     }
@@ -159,27 +160,38 @@ def _project_responses_node(node: dict[str, Any]) -> dict[str, Any]:
     properties = projected.get("properties")
     if isinstance(properties, dict):
         projected["properties"] = {
-            key: _project_responses_node(value)
+            key: _project_responses_node(value, path=f"{path}.properties[{key!r}]")
             for key, value in properties.items()
             if isinstance(key, str) and isinstance(value, dict)
         }
     definitions = projected.get("$defs")
     if isinstance(definitions, dict):
         projected["$defs"] = {
-            key: _project_responses_node(value)
+            key: _project_responses_node(value, path=f"{path}.$defs[{key!r}]")
             for key, value in definitions.items()
             if isinstance(key, str) and isinstance(value, dict)
         }
     items = projected.get("items")
     if isinstance(items, dict):
-        projected["items"] = _project_responses_node(items)
+        projected["items"] = _project_responses_node(items, path=f"{path}.items")
     alternatives = projected.get("anyOf")
     if isinstance(alternatives, list):
         projected["anyOf"] = [
-            _project_responses_node(value) for value in alternatives if isinstance(value, dict)
+            _project_responses_node(value, path=f"{path}.anyOf[{index}]")
+            for index, value in enumerate(alternatives)
+            if isinstance(value, dict)
         ]
 
     node_type = projected.get("type")
+    if node_type == "array" or isinstance(node_type, list) and "array" in node_type:
+        if "items" not in projected:
+            if isinstance(contains, dict):
+                projected["items"] = _project_responses_node(
+                    contains,
+                    path=f"{path}.items",
+                )
+            else:
+                raise SchemaError(f"Responses strict schema array at {path} requires items")
     if (
         node_type == "object"
         or isinstance(node_type, list)
