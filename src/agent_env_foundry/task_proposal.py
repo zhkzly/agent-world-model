@@ -23,7 +23,11 @@ from agent_env_foundry.environment import (
     validate_tool_catalog,
 )
 from agent_env_foundry.jsonvalue import is_json_object
-from agent_env_foundry.schema import SchemaError, validate_instance
+from agent_env_foundry.schema import (
+    SchemaError,
+    project_responses_strict_schema,
+    validate_instance,
+)
 from agent_env_foundry.task_contract import (
     CANDIDATE_TASK_FORMAT,
     TASK_PROPOSAL_EVIDENCE_FORMAT,
@@ -365,10 +369,7 @@ def _provider_turn(
 
 
 def _response_tool(spec: ToolSpec) -> JSONObject:
-    parameters = cast(JSONObject, json.loads(json.dumps(spec["input_schema"])))
-    if parameters.get("type") == "object":
-        parameters.setdefault("properties", {})
-        parameters.setdefault("required", [])
+    parameters = cast(JSONObject, project_responses_strict_schema(spec["input_schema"]))
     return {
         "type": "function",
         "name": spec["name"],

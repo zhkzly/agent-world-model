@@ -332,3 +332,12 @@ shape (and refusal outcome when present), not incidental public inspection order
 entity array position, paraphrase, or answer-field spelling. Previously accepted
 public instructions are fed only to the next proposal role to encourage a new
 objective; they never enter the acting-policy view or Task truth.
+
+`responses-schema-projection|介入1|返工1|nested additionalProperties+uniqueItems live failures→shared official-subset projection+local 8317 probe+2 mutation licences|红线违反0`
+
+Release and Task schemas remain full Draft 2020-12 Host authority. Responses
+tool/answer requests use one shared mechanical projection of that frozen schema:
+all wire-visible object fields are required, objects are closed, and unsupported
+wire-only constraints are omitted. The exact model result is still validated
+against the original schema, so the adapter cannot turn an invalid answer into a
+passing Task.

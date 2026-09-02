@@ -6,6 +6,7 @@ import pytest
 
 from agent_env_foundry.schema import (
     SchemaError,
+    project_responses_strict_schema,
     require_object_root,
     validate_instance,
     validate_schema_document,
@@ -137,3 +138,48 @@ def test_validate_instance_error_names_the_role() -> None:
 def test_validate_instance_bool_is_not_integer() -> None:
     with pytest.raises(SchemaError):
         validate_instance(True, {"type": "integer"}, role="strict bool/int")
+
+
+def test_responses_projection_closes_objects_and_removes_unsupported_constraints() -> None:
+    source = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "not": {"type": "string"},
+            "record": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "uniqueItems": True,
+                        "minItems": 1,
+                    },
+                },
+                "required": ["id"],
+                "additionalProperties": True,
+                "dependentRequired": {"id": ["tags"]},
+            },
+        },
+        "required": ["record"],
+        "additionalProperties": True,
+        "if": {"properties": {"record": {"type": "object"}}},
+        "then": {"required": ["record"]},
+    }
+
+    projected = project_responses_strict_schema(source)
+
+    assert set(projected) == {"type", "properties", "required", "additionalProperties"}
+    assert projected["additionalProperties"] is False
+    assert projected["required"] == ["not", "record"]
+    assert "not" in projected["properties"]
+    record = projected["properties"]["record"]
+    assert record["additionalProperties"] is False
+    assert record["required"] == ["id", "tags"]
+    assert "dependentRequired" not in record
+    tags = record["properties"]["tags"]
+    assert "uniqueItems" not in tags
+    assert tags["minItems"] == 1
+    assert source["properties"]["record"]["additionalProperties"] is True
+    assert source["properties"]["record"]["properties"]["tags"]["uniqueItems"] is True

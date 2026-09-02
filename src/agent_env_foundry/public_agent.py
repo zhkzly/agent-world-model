@@ -30,7 +30,11 @@ from agent_env_foundry.episodes import (
     PublicEpisodeInput,
 )
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
-from agent_env_foundry.schema import SchemaError, validate_instance
+from agent_env_foundry.schema import (
+    SchemaError,
+    project_responses_strict_schema,
+    validate_instance,
+)
 
 PublicAgentFailureKind = Literal[
     "EnvironmentDefect",
@@ -269,7 +273,9 @@ class ResponsesPolicyDriver:
                 "format": {
                     "type": "json_schema",
                     "name": "public_episode_answer",
-                    "schema": _responses_text_schema(cast(JSONObject, public["answer_schema"])),
+                    "schema": project_responses_strict_schema(
+                        cast(JSONObject, public["answer_schema"])
+                    ),
                     "strict": True,
                 }
             },
@@ -278,82 +284,9 @@ class ResponsesPolicyDriver:
 
 
 def _responses_parameters(value: JSONObject) -> JSONObject:
-    """Add only the mechanical empty-object members required by strict tools."""
+    """Project a ToolSpec input schema onto the same strict wire subset."""
 
-    schema = cast(JSONObject, json.loads(json.dumps(value, ensure_ascii=False)))
-    if schema.get("type") == "object" and "properties" not in schema and "required" not in schema:
-        schema["properties"] = {}
-        schema["required"] = []
-    return schema
-
-
-def _responses_text_schema(value: JSONObject) -> JSONObject:
-    """Project exact JSON Schema into the local provider's supported wire subset."""
-
-    schema = cast(JSONObject, json.loads(json.dumps(value, ensure_ascii=False)))
-
-    def visit(node: JSONValue) -> None:
-        if isinstance(node, dict):
-            if "const" in node:
-                constant = node["const"]
-                if isinstance(constant, (dict, list)):
-                    node.pop("const")
-                    for key, child in _json_shape(constant).items():
-                        node.setdefault(key, child)
-                elif "type" not in node:
-                    node["type"] = _json_type(constant)
-            node_type = node.get("type")
-            if (
-                node_type == "object"
-                or isinstance(node_type, list)
-                and "object" in node_type
-                or "properties" in node
-            ):
-                node["additionalProperties"] = False
-            for child in node.values():
-                visit(child)
-        elif isinstance(node, list):
-            for child in node:
-                visit(child)
-
-    visit(schema)
-    return schema
-
-
-def _json_shape(value: JSONValue) -> JSONObject:
-    kind = _json_type(value)
-    if isinstance(value, dict):
-        return {
-            "type": "object",
-            "properties": {key: _json_shape(child) for key, child in value.items()},
-            "required": list(value),
-            "additionalProperties": False,
-        }
-    if isinstance(value, list):
-        item_types = sorted({_json_type(item) for item in value}) or ["string"]
-        items: JSONObject = (
-            {"type": item_types[0]}
-            if len(item_types) == 1
-            else {"anyOf": [{"type": item} for item in item_types]}
-        )
-        return {"type": "array", "items": items}
-    return {"type": kind}
-
-
-def _json_type(value: JSONValue) -> str:
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "number"
-    if isinstance(value, str):
-        return "string"
-    if isinstance(value, list):
-        return "array"
-    return "object"
+    return cast(JSONObject, project_responses_strict_schema(value))
 
 
 def capture_public_episode(
