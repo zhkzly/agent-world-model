@@ -117,7 +117,7 @@ class TaskProposalEvidence:
 class CandidateTaskContract:
     format: str
     release_id: str
-    research_digest: str
+    builder_projection_digest: str
     reset_start: JSONObject | None
     instruction: str
     final_answer_schema: JSONObject
@@ -128,7 +128,7 @@ class CandidateTaskContract:
         if self.format != CANDIDATE_TASK_FORMAT:
             raise ValueError(f"candidate format must be {CANDIDATE_TASK_FORMAT!r}")
         _digest(self.release_id, "release_id")
-        _digest(self.research_digest, "research_digest")
+        _digest(self.builder_projection_digest, "builder_projection_digest")
         _digest(self.proposal_evidence_digest, "proposal_evidence_digest")
         _text(self.instruction, "instruction")
         _text(self.checker_brief, "checker_brief")
@@ -147,7 +147,7 @@ class CandidateTaskContract:
         return {
             "format": self.format,
             "release_id": self.release_id,
-            "research_digest": self.research_digest,
+            "builder_projection_digest": self.builder_projection_digest,
             "reset_start": (
                 _copy_object(self.reset_start) if self.reset_start is not None else None
             ),
@@ -163,7 +163,7 @@ class TaskContract:
     format: str
     candidate_id: str
     release_id: str
-    research_digest: str
+    builder_projection_digest: str
     reset_start: JSONObject | None
     instruction: str
     final_answer_schema: JSONObject
@@ -176,7 +176,7 @@ class TaskContract:
         for value, role in (
             (self.candidate_id, "candidate_id"),
             (self.release_id, "release_id"),
-            (self.research_digest, "research_digest"),
+            (self.builder_projection_digest, "builder_projection_digest"),
             (self.checker_project_digest, "checker_project_digest"),
         ):
             _digest(value, role)
@@ -198,7 +198,7 @@ class TaskContract:
             "format": self.format,
             "candidate_id": self.candidate_id,
             "release_id": self.release_id,
-            "research_digest": self.research_digest,
+            "builder_projection_digest": self.builder_projection_digest,
             "reset_start": (
                 _copy_object(self.reset_start) if self.reset_start is not None else None
             ),
@@ -318,7 +318,7 @@ def seal_task_contract(
         TASK_CONTRACT_FORMAT,
         candidate.candidate_id,
         candidate.release_id,
-        candidate.research_digest,
+        candidate.builder_projection_digest,
         candidate.reset_start,
         candidate.instruction,
         candidate.final_answer_schema,

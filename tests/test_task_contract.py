@@ -42,7 +42,7 @@ def _candidate() -> CandidateTaskContract:
     return CandidateTaskContract(
         format="candidate-task-contract/1",
         release_id="1" * 64,
-        research_digest="2" * 64,
+        builder_projection_digest="2" * 64,
         reset_start=None,
         instruction="Approve the eligible request and report its final status.",
         final_answer_schema={

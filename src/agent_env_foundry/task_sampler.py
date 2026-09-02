@@ -39,7 +39,7 @@ def sample_good_tasks(
     prepared: PreparedTaskEnvironment,
     *,
     development_brief: JSONObject,
-    research_digest: str,
+    builder_projection_digest: str,
     output_root: Path,
     candidate_budget: int,
     target_count: int,
@@ -81,7 +81,7 @@ def sample_good_tasks(
             proposed = propose_task_direct(
                 prepared,
                 development_brief=development_brief,
-                research_digest=research_digest,
+                builder_projection_digest=builder_projection_digest,
                 instance_directory=attempt_root / "proposal-instance",
                 route=selected_route,
                 client_factory=client_factory,

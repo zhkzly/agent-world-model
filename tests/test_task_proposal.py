@@ -157,7 +157,7 @@ def test_direct_proposal_uses_public_tools_and_host_captures_protected_evidence(
     result = propose_task_direct(
         prepared,
         development_brief={"need": "Maintain a persistent counter."},
-        research_digest="2" * 64,
+        builder_projection_digest="2" * 64,
         instance_directory=tmp_path / "instance",
         route=AgentRoute(),
         client_factory=lambda **kwargs: client,
@@ -200,7 +200,7 @@ def test_direct_proposal_returns_nested_contract_error_for_same_history_repair(
     result = propose_task_direct(
         Prepared(),
         development_brief={"need": "Maintain a persistent counter."},
-        research_digest="2" * 64,
+        builder_projection_digest="2" * 64,
         instance_directory=tmp_path / "instance",
         route=AgentRoute(),
         client_factory=lambda **kwargs: client,
@@ -217,7 +217,7 @@ def test_direct_proposal_rejects_terminal_without_real_public_action(tmp_path) -
         propose_task_direct(
             Prepared(),
             development_brief={"need": "Maintain a persistent counter."},
-            research_digest="2" * 64,
+            builder_projection_digest="2" * 64,
             instance_directory=tmp_path / "instance",
             route=AgentRoute(),
             client_factory=lambda **kwargs: client,
@@ -229,7 +229,7 @@ def test_provider_request_contract_failure_is_attributed_to_framework(tmp_path) 
         propose_task_direct(
             Prepared(),
             development_brief={"need": "Maintain a persistent counter."},
-            research_digest="2" * 64,
+            builder_projection_digest="2" * 64,
             instance_directory=tmp_path / "instance",
             route=AgentRoute(),
             client_factory=lambda **kwargs: BadRequestClient(),

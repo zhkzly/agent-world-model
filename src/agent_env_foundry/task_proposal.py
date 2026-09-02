@@ -134,7 +134,7 @@ def propose_task_direct(
     prepared: PreparedTaskEnvironment,
     *,
     development_brief: JSONObject,
-    research_digest: str,
+    builder_projection_digest: str,
     instance_directory: Path,
     route: AgentRoute | None = None,
     reset_start: JSONObject | None = None,
@@ -285,7 +285,7 @@ def propose_task_direct(
     candidate = CandidateTaskContract(
         CANDIDATE_TASK_FORMAT,
         prepared.identity.release_id,
-        research_digest,
+        builder_projection_digest,
         reset_start,
         fields.instruction,
         fields.final_answer_schema,

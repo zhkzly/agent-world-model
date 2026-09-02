@@ -79,7 +79,7 @@ def test_sampler_rejects_one_candidate_then_continues_without_pressure_pipeline(
     report = sample_good_tasks(
         prepared,
         development_brief={"need": "Sample Tasks."},
-        research_digest="5" * 64,
+        builder_projection_digest="5" * 64,
         output_root=tmp_path / "sampling",
         candidate_budget=2,
         target_count=1,
