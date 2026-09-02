@@ -324,3 +324,11 @@ Builder self-verdict, Task, answer or reward enters S1 acceptance.
 `s2-exhaustive-budget-sampling|介入0|返工0|15 attempts+no Task quota+pre-checker structural dedup+2 mutation licences|红线违反0`
 
 `s2-task-campaign-handoff|介入0|返工0|cold TaskPack+relocation+resumable records+CorpusManifest+2 mutation licences|红线违反0`
+
+`s2-effect-structure-dedup|介入1|返工1|15-candidate real Library replay: duplicate recall 2/13→13/13; live cross-domain validation pending|红线违反0`
+
+Task structure is conservatively keyed by normalized protected state-effect
+shape (and refusal outcome when present), not incidental public inspection order,
+entity array position, paraphrase, or answer-field spelling. Previously accepted
+public instructions are fed only to the next proposal role to encourage a new
+objective; they never enter the acting-policy view or Task truth.
