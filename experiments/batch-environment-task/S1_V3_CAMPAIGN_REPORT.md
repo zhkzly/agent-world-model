@@ -95,6 +95,12 @@ post-transition protected snapshot validated and remained stable after reopen.
    its 42 attempt directories are supplemented by the consolidated failure
    audit in this report.
 
+After the campaign, these findings also produced one task-free Host diagnostic
+carrier. A fresh Codex library canary authored two scenarios with nine real
+steps; Framework executed both in two independent instances and issued cold
+Release `f94bd24e18a393838789ff621b485c078c0966f84d24bcbb94623cbf5a8ae41b`.
+The scenarios contain no instruction, answer, reward, checker or witness.
+
 ## Final audit boundary
 
 All 20 current Release directories cold-verified with unique IDs. A fresh raw

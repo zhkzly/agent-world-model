@@ -39,7 +39,8 @@ provisional Release.
 - `read_state` is deterministic, schema-valid, read-only and invisible to an
   acting policy.
 - Conformance binds exact actor bytes, ToolSpecs, start/reset/state schemas,
-  physical replay/persistence/isolation evidence and cold package bytes.
+  task-free Host-executed diagnostic traces, physical replay/persistence/
+  isolation evidence and cold package bytes.
 - Any stage failure returns a typed non-release outcome and emits no later
   artifact.
 - CapabilitySpecs, TaskSemantics, answer fields, Task checkers, witnesses and
@@ -53,6 +54,7 @@ provisional Release.
 | Research cannot close | typed Research failure; no Builder |
 | actor build/test/lock fails | Environment or Infrastructure; no conformance |
 | public/state surface invalid | Environment defect; no publication |
+| diagnostic tool coverage/outcome/state effect/replay invalid | Environment defect; return to Builder before publication |
 | reset/replay/persistence/isolation/readback fails | conformance failure; no publication |
 | receipt/layout/ZIP/cold prepare fails | Publication failure; no released ID |
 | old format requested | unsupported; no conversion |
@@ -64,6 +66,8 @@ provisional Release.
 - actor/state input and digest mutations;
 - public versus protected visibility tests;
 - real reset/invoke/persistence/isolation/readback;
+- Builder-authored domain arguments executed twice by the Host with complete
+  tool success coverage, refusal atomicity and per-step protected-state checks;
 - readback no-mutation and close/reopen stability;
 - filesystem/Git plus SQLite cold relocation;
 - old TaskSemantics/Verifier production references equal zero.

@@ -26,7 +26,7 @@ from agent_env_foundry.errors import EnvironmentRuntimeError
 OK_SPEC: dict[str, Any] = {
     "name": "t",
     "description": "mechanical tool",
-    "input_schema": {"type": "object"},
+    "input_schema": {"type": "object", "properties": {}, "required": []},
     "output_schema": {"type": "object"},
 }
 
@@ -163,6 +163,18 @@ def test_validate_tool_catalog_canonicalizes_missing_input_object_root() -> None
     assert "type" not in raw["input_schema"]
 
 
+def test_validate_tool_catalog_canonicalizes_equivalent_object_schema_forms() -> None:
+    raw = make_spec(input_schema={"type": ["object"]})
+
+    normalized = validate_tool_catalog((raw,))["t"]
+
+    assert normalized["input_schema"] == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    }
+
+
 def test_validate_tool_catalog_extracts_exact_wrapped_success_data_schema() -> None:
     data_schema = {
         "type": "object",
@@ -213,7 +225,6 @@ def test_validate_tool_catalog_extracts_exact_wrapped_success_data_schema() -> N
         (make_spec(name=7),),
         (make_spec(description=7),),
         (make_spec(input_schema={"type": "string"}),),
-        (make_spec(input_schema={"type": ["object"]}),),
         (make_spec(input_schema={"type": "object", "properties": {"a": {"$ref": "http://e/x"}}}),),
         (make_spec(output_schema={"$ref": "http://e/y"}),),
         (make_spec(input_schema={"type": 3}),),

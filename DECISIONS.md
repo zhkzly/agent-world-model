@@ -272,3 +272,12 @@ Known failures now become same-thread Builder preflight feedback through full
 environment Conformance and an AST entropy scan; Framework does not infer
 nullable domain semantics from one observed value. The evidence report states
 that S2 Task/reward and training-gain claims remain unproven.
+
+`s1-v3-host-diagnostics|介入0|返工1|real Codex 9-step canary+dual-instance Host replay+5 mutation licences+560 full tests|红线违反0`
+
+The diagnostic carrier contains only reset input, public tool arguments,
+success/refusal expectation, stable refusal code and protected-state effect.
+Framework owns execution, schema validation, refusal atomicity, two-instance
+replay and reopen. Exact keys prohibit instructions, answers, rewards,
+checkers, witnesses and admission claims, so this strengthens S1 mechanics
+without creating Task truth or a second verifier authority.

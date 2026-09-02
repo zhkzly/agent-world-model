@@ -34,6 +34,10 @@ input file.
    package data, and diagnostic tests. Do not write release, conformance or Task
    metadata; the Host assembles EnvironmentRelease/3. Do not write TaskSemantics,
    a Task checker or a Qualification Verifier.
+   Author `docs/conformance/scenarios.json` exactly as specified by the contract.
+   Supply domain-valid reset inputs and arguments; the Host owns execution,
+   schema checks, state-effect checks, refusal atomicity and two-instance replay.
+   Diagnostic scenarios contain no Task instruction, answer, reward or checker.
    Include tests for native state change, multi-step value reuse, refusal
    without prohibited mutation, reset, reload, instance isolation, and the
    absence of complete query-answer leakage from reset. Tests must also prove

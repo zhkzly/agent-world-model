@@ -155,9 +155,7 @@ def validate_tool_catalog(specs: Any, *, role: str = "tools()") -> dict[str, Too
             raise EnvironmentRuntimeError(
                 f"{role} entry {position} ({name!r}) description must be a string"
             )
-        input_schema = spec["input_schema"]
-        if isinstance(input_schema, dict) and "type" not in input_schema:
-            input_schema = {"type": "object", **input_schema}
+        input_schema = _canonical_input_schema(spec["input_schema"])
         output_schema = _canonical_output_schema(spec["output_schema"])
         try:
             require_object_root(input_schema, role=f"tool {name!r} input_schema")
@@ -171,6 +169,21 @@ def validate_tool_catalog(specs: Any, *, role: str = "tools()") -> dict[str, Too
         normalized["output_schema"] = output_schema
         index[name] = cast(ToolSpec, normalized)
     return index
+
+
+def _canonical_input_schema(schema: Any) -> Any:
+    """Normalize only JSON-Schema forms equivalent under the object-only ABI."""
+
+    if not isinstance(schema, dict):
+        return schema
+    normalized = dict(schema)
+    declared_type = normalized.get("type")
+    if declared_type is None or declared_type == ["object"]:
+        normalized["type"] = "object"
+    if normalized.get("type") == "object":
+        normalized.setdefault("properties", {})
+        normalized.setdefault("required", [])
+    return normalized
 
 
 def _canonical_output_schema(schema: Any) -> Any:

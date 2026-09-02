@@ -106,6 +106,34 @@ observable there, with deterministic ordering where collections are unordered.
 Do not write `release.json`, `payload-manifest.json`, conformance receipts or
 digests. The Host creates the sole EnvironmentRelease/3 descriptor.
 
+## Host-executed diagnostic scenarios
+
+Write `docs/conformance/scenarios.json` with format
+`environment-diagnostics/1`. Each scenario contains only:
+
+```text
+scenario_id
+reset: object | null
+steps[]:
+  tool
+  arguments
+  expected_ok
+  state_effect: changed | unchanged
+  expected_error_code: string | null
+```
+
+Provide at least one real successful case for every public tool, at least one
+state-changing success, and at least one domain refusal with unchanged state
+and its stable error code. Arguments and sequence are domain decisions owned by
+the Builder. The Host—not project test code—executes every scenario twice in
+fresh instances, validates every ToolObservation and protected state, checks
+the declared state effect and refusal atomicity, compares replay, and checks
+close/reopen persistence.
+
+These are environment diagnostics, not Tasks: do not include a natural-language
+instruction, expected final answer, reward, checker, solution, witness, rubric,
+or task-admission claim.
+
 ## Project quality
 
 Include meaningful package data, diagnostic tests, `uv.lock`, and all declared

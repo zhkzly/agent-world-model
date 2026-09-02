@@ -14,6 +14,7 @@ The one frozen actor project owns:
 public make_environment(instance_directory)
 protected read_state(instance_directory)
 start/reset/state schemas
+task-free diagnostic scenarios
 environment-specific tests and locked dependencies
 ```
 
@@ -30,6 +31,7 @@ public actor factory
 protected state reader factory
 start/reset/state schema digests
 ToolSpec catalog digest
+diagnostic scenario and replay-trace digests
 project test/build evidence digest
 reset/replay/persistence/isolation evidence digest
 protected-read no-mutation evidence digest
@@ -71,6 +73,9 @@ exists.
 - directory and ZIP identity equality;
 - cold relocation and same-name release isolation;
 - public policy projection cannot discover protected state;
+- every public tool has a Host-executed successful diagnostic, at least one
+  domain refusal remains state-invariant, and identical scenarios replay in
+  two fresh instances;
 - real filesystem/Git and SQLite conformance;
 - mutation licences for every receipt-to-payload binding edge.
 
@@ -79,5 +84,7 @@ exists.
 - v1/v2 migration or alternate readers;
 - `allow_unqualified` or a format feature flag;
 - task-case positive/noop evidence in S1;
+- natural-language instructions, answers, rewards, checkers or witnesses in an
+  environment diagnostic scenario;
 - domain-specific Framework checks;
 - generated code authorizing its own receipt.

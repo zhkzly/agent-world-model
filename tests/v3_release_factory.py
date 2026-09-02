@@ -51,6 +51,36 @@ source = { editable = "." }
     _write(root / "docs/schemas/start.json", json.dumps(start))
     _write(root / "docs/schemas/reset.json", json.dumps(reset))
     _write(root / "docs/schemas/state.json", json.dumps(state))
+    _write(
+        root / "docs/conformance/scenarios.json",
+        json.dumps(
+            {
+                "format": "environment-diagnostics/1",
+                "scenarios": [
+                    {
+                        "scenario_id": "increment-and-refuse",
+                        "reset": None,
+                        "steps": [
+                            {
+                                "tool": "increment",
+                                "arguments": {"amount": 1},
+                                "expected_ok": True,
+                                "state_effect": "changed",
+                                "expected_error_code": None,
+                            },
+                            {
+                                "tool": "increment",
+                                "arguments": {"amount": 99},
+                                "expected_ok": False,
+                                "state_effect": "unchanged",
+                                "expected_error_code": "amount_too_large",
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+    )
     return root
 
 

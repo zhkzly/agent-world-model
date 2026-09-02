@@ -48,6 +48,12 @@ class CounterEnvironment:
         if tool_name != "increment":
             raise ValueError(f"unknown tool {tool_name}")
         state = self._read()
+        if int(arguments["amount"]) > 10:
+            return {
+                "ok": False,
+                "data": None,
+                "error": {"code": "amount_too_large", "message": "amount exceeds limit"},
+            }
         state["count"] += int(arguments["amount"])
         self._write(state)
         return {"ok": True, "data": dict(state), "error": None}

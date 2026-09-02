@@ -96,6 +96,7 @@ def test_prepare_workspace_has_no_domain_source_and_one_projection(
         "invoke",
         "close",
         "read_state",
+        "docs/conformance/scenarios.json",
         "ToolObservation",
         "instance directory",
         "prohibited mutation",
@@ -523,6 +524,37 @@ def _candidate_root(tmp_path: Path, name: str) -> Path:
     (schemas / "start.json").write_text(schema)
     (schemas / "reset.json").write_text(schema)
     (schemas / "state.json").write_text(schema)
+    scenarios = root / "docs/conformance/scenarios.json"
+    scenarios.parent.mkdir(parents=True)
+    scenarios.write_text(
+        json.dumps(
+            {
+                "format": "environment-diagnostics/1",
+                "scenarios": [
+                    {
+                        "scenario_id": "fixture",
+                        "reset": None,
+                        "steps": [
+                            {
+                                "tool": "fixture",
+                                "arguments": {},
+                                "expected_ok": True,
+                                "state_effect": "changed",
+                                "expected_error_code": None,
+                            },
+                            {
+                                "tool": "fixture",
+                                "arguments": {},
+                                "expected_ok": False,
+                                "state_effect": "unchanged",
+                                "expected_error_code": "fixture_refusal",
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+    )
     return root
 
 
@@ -603,6 +635,16 @@ def test_candidate_checks_reject_noncanonical_schema_handoff_paths(
     assert "docs/schemas/start.json" in public_contract.stderr
     assert "docs/schemas/reset.json" in public_contract.stderr
     assert "docs/schemas/state.json" in public_contract.stderr
+
+
+def test_public_contract_requires_host_executed_diagnostic_scenarios(tmp_path: Path) -> None:
+    root = _candidate_root(tmp_path, "candidate")
+    (root / "docs/conformance/scenarios.json").unlink()
+
+    result = builder_module._public_contract_check(root)
+
+    assert not result.passed
+    assert "docs/conformance/scenarios.json" in result.stderr
 
 
 def test_live_actor_contract_canonicalizes_missing_input_root_before_conformance(
@@ -730,6 +772,8 @@ def test_contract_document_keeps_release_assembly_out_of_builder() -> None:
     assert "ambient wall clock" in text
     assert "legitimately `null`" in text
     assert "after every representative state-changing workflow" in text
+    assert "environment-diagnostics/1" in text
+    assert "not Tasks" in text
     assert "execute every public tool" in text
     assert "exact ToolSpec" in text
     assert "Do not write `release.json`" in text
@@ -742,6 +786,8 @@ def test_environment_codegen_skill_requires_complete_tool_schema_matrix() -> Non
     assert "fixed success/refusal envelope" in text
     assert 'observation["data"]' in text
     assert "that ToolSpec's `output_schema`" in text
+    assert "docs/conformance/scenarios.json" in text
+    assert "Host owns execution" in text
     assert "read_state" in text and "task-neutral" in text
 
 

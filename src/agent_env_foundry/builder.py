@@ -16,6 +16,7 @@ from typing import Any
 import rfc8785
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
+from agent_env_foundry.diagnostic_scenarios import DIAGNOSTIC_SCENARIOS_PATH
 from agent_env_foundry.physical_runtime import (
     PreparationSettings,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "BuilderFailure",
     "CandidateBuild",
     "CommandResult",
+    "DIAGNOSTIC_SCENARIOS_PATH",
     "PreparedBuilderWorkspace",
     "RESET_OBSERVATION_SCHEMA_PATH",
     "STATE_READER_FACTORY",
@@ -367,6 +369,26 @@ def _public_contract_check(root: Path) -> CommandResult:
             failures.append(
                 {
                     "path": relative.as_posix(),
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    diagnostic_path = root / DIAGNOSTIC_SCENARIOS_PATH
+    if diagnostic_path.is_symlink() or not diagnostic_path.is_file():
+        failures.append(
+            {
+                "path": DIAGNOSTIC_SCENARIOS_PATH.as_posix(),
+                "reason": "missing_regular_file",
+            }
+        )
+    else:
+        try:
+            diagnostic_document = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+            if not isinstance(diagnostic_document, dict):
+                raise ValueError("diagnostic document must be a JSON object")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            failures.append(
+                {
+                    "path": DIAGNOSTIC_SCENARIOS_PATH.as_posix(),
                     "reason": f"{type(exc).__name__}: {exc}",
                 }
             )

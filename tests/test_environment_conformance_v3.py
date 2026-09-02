@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -57,6 +58,13 @@ def test_v3_conformance_issues_host_receipt_from_physical_actor(tmp_path: Path) 
     assert host["reopen_persistence"] is True
     assert host["controlled_reset_replay"] is True
     assert host["instance_isolation"] is True
+    assert host["diagnostic_results"] == [
+        {
+            "scenario_id": "increment-and-refuse",
+            "step_count": 2,
+            "trace_digest": host["diagnostic_results"][0]["trace_digest"],
+        }
+    ]
 
 
 def test_v3_conformance_rejects_incomplete_builder_evidence(tmp_path: Path) -> None:
@@ -84,3 +92,82 @@ def test_replay_projection_normalizes_only_the_host_instance_locator(tmp_path: P
         "similar_but_external": str(tmp_path / "instance-ab/file.txt"),
         "nested": ["<INSTANCE_ROOT>/README.md", 3],
     }
+
+
+def test_v3_diagnostic_runner_rejects_refusal_state_mutation(tmp_path: Path) -> None:
+    actor = build_actor_project(tmp_path / "actor")
+    source_path = actor / "src/generated_environment/release.py"
+    source = source_path.read_text(encoding="utf-8")
+    source_path.write_text(
+        source.replace(
+            'if int(arguments["amount"]) > 10:\n            return {',
+            'if int(arguments["amount"]) > 10:\n'
+            '            self._write({"count": state["count"] + 1})\n'
+            "            return {",
+        ),
+        encoding="utf-8",
+    )
+    digest = compute_authored_project_digest(actor, "actor", require_locked_project=True)
+    phases = (
+        "lock",
+        "sync",
+        "build",
+        "tests",
+        "public_contract",
+        "source_determinism",
+        "live_contract",
+    )
+    checks = tuple(CommandResult(phase, ("physical", phase), 0, "passed", "") for phase in phases)
+
+    with pytest.raises(PreparationExecutionErrorV3) as caught:
+        run_environment_conformance_v3_internal(
+            CandidateBuild(actor, "fixture-thread", digest, "fixture", checks),
+            tmp_path / "runtime",
+            settings=_settings(),
+        )
+
+    assert caught.value.code == "diagnostic_state_effect_mismatch"
+
+
+def test_v3_diagnostic_runner_rejects_instance_derived_replay_state(tmp_path: Path) -> None:
+    actor = build_actor_project(tmp_path / "actor")
+    source_path = actor / "src/generated_environment/release.py"
+    source = source_path.read_text(encoding="utf-8")
+    source_path.write_text(
+        source.replace("import importlib.util", "import hashlib\nimport importlib.util")
+        .replace(
+            'state["count"] += int(arguments["amount"])\n        self._write(state)',
+            'state["count"] += int(arguments["amount"])\n'
+            '        state["nonce"] = hashlib.sha256(str(self.root).encode()).hexdigest()\n'
+            "        self._write(state)",
+        )
+        .replace(
+            '"data": dict(state)',
+            '"data": {"count": state["count"]}',
+        ),
+        encoding="utf-8",
+    )
+    state_schema_path = actor / "docs/schemas/state.json"
+    state_schema = json.loads(state_schema_path.read_text(encoding="utf-8"))
+    state_schema["properties"]["nonce"] = {"type": "string"}
+    state_schema_path.write_text(json.dumps(state_schema), encoding="utf-8")
+    digest = compute_authored_project_digest(actor, "actor", require_locked_project=True)
+    phases = (
+        "lock",
+        "sync",
+        "build",
+        "tests",
+        "public_contract",
+        "source_determinism",
+        "live_contract",
+    )
+    checks = tuple(CommandResult(phase, ("physical", phase), 0, "passed", "") for phase in phases)
+
+    with pytest.raises(PreparationExecutionErrorV3) as caught:
+        run_environment_conformance_v3_internal(
+            CandidateBuild(actor, "fixture-thread", digest, "fixture", checks),
+            tmp_path / "runtime",
+            settings=_settings(),
+        )
+
+    assert caught.value.code == "diagnostic_replay_drift"
