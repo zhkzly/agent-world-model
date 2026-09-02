@@ -594,6 +594,64 @@ def test_responses_wire_projects_collection_consts_without_changing_host_schema(
     assert answer_schema["properties"]["paths"] == {"const": ["README.md"]}
 
 
+def test_responses_wire_closes_nested_object_without_changing_host_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    responses = Responses([_call_response()])
+    driver = ResponsesPolicyDriver.from_route(
+        AgentRoute(), client_factory=lambda **_kwargs: Client(responses)
+    )
+    answer_schema = {
+        "type": "object",
+        "properties": {
+            "record": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": True,
+            }
+        },
+        "required": ["record"],
+        "additionalProperties": False,
+    }
+    public_input = PublicEpisodeInput(
+        PUBLIC_AGENT_SYSTEM_PROMPT,
+        "Inspect state.",
+        {},
+        (_tool(),),
+        answer_schema,
+    )
+
+    driver.start(public_input)
+    driver.next_decision(())
+
+    wire_record = responses.requests[0]["text"]["format"]["schema"]["properties"]["record"]
+    assert wire_record["additionalProperties"] is False
+    assert answer_schema["properties"]["record"]["additionalProperties"] is True
+
+
+def test_run_public_episode_attributes_bad_request_to_framework(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    responses = Responses([StatusFailure(400)])
+
+    with pytest.raises(PublicAgentFailure) as caught:
+        run_public_episode(
+            actor=Actor(),
+            instruction="Inspect public-1.",
+            reset_observation={},
+            tool_specs=(_tool(),),
+            answer_schema=_answer_schema(),
+            client_factory=lambda **_kwargs: Client(responses),
+            max_provider_turns=1,
+        )
+
+    assert caught.value.kind == "FrameworkDefect"
+    assert caught.value.code == "responses_request_failed"
+
+
 def test_host_rejects_duplicate_call_ids() -> None:
     duplicate = _capture(
         ScriptedDriver(

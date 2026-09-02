@@ -32,7 +32,12 @@ from agent_env_foundry.episodes import (
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
 from agent_env_foundry.schema import SchemaError, validate_instance
 
-PublicAgentFailureKind = Literal["EnvironmentDefect", "InfrastructureFailure", "NoPublicWitness"]
+PublicAgentFailureKind = Literal[
+    "EnvironmentDefect",
+    "FrameworkDefect",
+    "InfrastructureFailure",
+    "NoPublicWitness",
+]
 type _DriverCall = tuple[JSONValue, JSONValue, JSONValue]
 type _DriverTerminal = Literal["none", "final_answer", "refusal"]
 
@@ -297,6 +302,14 @@ def _responses_text_schema(value: JSONObject) -> JSONObject:
                         node.setdefault(key, child)
                 elif "type" not in node:
                     node["type"] = _json_type(constant)
+            node_type = node.get("type")
+            if (
+                node_type == "object"
+                or isinstance(node_type, list)
+                and "object" in node_type
+                or "properties" in node
+            ):
+                node["additionalProperties"] = False
             for child in node.values():
                 visit(child)
         elif isinstance(node, list):
@@ -379,11 +392,13 @@ def run_public_episode(
         actor, instruction, reset_observation, answer_schema, driver, tool_specs
     )
     if capture.defect is not None:
-        kind: PublicAgentFailureKind = (
-            "EnvironmentDefect"
-            if capture.defect.owner == "environment"
-            else "InfrastructureFailure"
-        )
+        kind: PublicAgentFailureKind
+        if capture.defect.owner == "environment":
+            kind = "EnvironmentDefect"
+        elif capture.defect.owner == "evidence":
+            kind = "FrameworkDefect"
+        else:
+            kind = "InfrastructureFailure"
         raise PublicAgentFailure(
             kind,
             capture.defect.code,
