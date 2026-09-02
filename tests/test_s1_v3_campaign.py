@@ -70,6 +70,35 @@ def test_s1_v3_campaign_summary_separates_release_and_failure_metrics() -> None:
     assert summary["summary_id"]
 
 
+def test_campaign_identity_is_independent_of_runtime_concurrency() -> None:
+    module = _campaign_module()
+
+    config = module._campaign_config("suite-digest", "source-commit")
+
+    assert config == {
+        "format": "s1-v3-campaign-config/2",
+        "suite_digest": "suite-digest",
+        "source_commit": "source-commit",
+        "environment_model": "gpt-5.6-luna",
+        "semantic_reviewer_model": "gpt-5.6-luna",
+        "base_url": "http://127.0.0.1:8317/v1",
+    }
+    assert "workers" not in config
+
+
+def test_serial_warmup_selects_only_next_unreleased_need() -> None:
+    module = _campaign_module()
+    needs = tuple(
+        {"id": f"need-{index}", "domain": "d", "family": "f", "need": "n"} for index in range(1, 5)
+    )
+    records = {"need-1": {"need_id": "need-1", "terminal": "released"}}
+
+    selected = module._select_needs_for_run(needs, records, max_new=1)
+
+    assert [item["id"] for item in selected] == ["need-2"]
+    assert module._select_needs_for_run(needs, records, max_new=None) == needs
+
+
 def test_s1_v3_campaign_preserves_unexpected_worker_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

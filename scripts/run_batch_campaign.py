@@ -141,6 +141,9 @@ def _released_record(
         "release_id": generation.release_id,
         "release_root": str(generation.release_root.relative_to(campaign_root)),
         "release_archive": str(generation.archive.relative_to(campaign_root)),
+        "research_ready": str(
+            (attempt / "generation-work/research/ResearchReady.json").relative_to(campaign_root)
+        ),
         "release_archive_bytes": generation.archive.stat().st_size,
         "research_digest": generation.research_digest,
         "research_sources": len(tuple((research_root / "source-revisions").glob("*"))),
@@ -304,15 +307,64 @@ def _summary(
     return {**summary, "summary_id": _digest(summary)}
 
 
+def _campaign_config(suite_digest: str, source_commit: str) -> dict[str, Any]:
+    """Campaign identity binds semantics and source, never runtime scheduling."""
+
+    return {
+        "format": "s1-v3-campaign-config/2",
+        "suite_digest": suite_digest,
+        "source_commit": source_commit,
+        "environment_model": "gpt-5.6-luna",
+        "semantic_reviewer_model": "gpt-5.6-luna",
+        "base_url": "http://127.0.0.1:8317/v1",
+    }
+
+
+def _select_needs_for_run(
+    needs: tuple[dict[str, str], ...],
+    records: dict[str, dict[str, Any]],
+    *,
+    max_new: int | None,
+) -> tuple[dict[str, str], ...]:
+    if max_new is None:
+        return needs
+    pending = tuple(
+        need for need in needs if records.get(need["id"], {}).get("terminal") != "released"
+    )
+    return pending[:max_new]
+
+
+def _existing_records(
+    campaign_root: Path,
+    *,
+    campaign_id: str,
+    suite_digest: str,
+) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for path in sorted((campaign_root / "records").glob("*.json")):
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            document.get("campaign_id") != campaign_id
+            or document.get("suite_digest") != suite_digest
+            or not isinstance(document.get("need_id"), str)
+        ):
+            raise ValueError(f"record identity drift at {path}")
+        records[document["need_id"]] = document
+    return records
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--suite", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--max-new", type=int)
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.workers <= 4:
         raise ValueError("workers must be between 1 and 4")
+    if args.max_new is not None and not 1 <= args.max_new <= 20:
+        raise ValueError("max-new must be between 1 and 20")
     repo = Path(__file__).resolve().parents[1]
     needs = _read_suite(args.suite)
     suite_document = {"format": "need-suite/1", "needs": list(needs)}
@@ -324,24 +376,32 @@ def main() -> None:
     if _git(repo, "status", "--porcelain"):
         raise RuntimeError("official campaign requires a clean source worktree")
     source_commit = _git(repo, "rev-parse", "HEAD")
-    config = {
-        "format": "s1-v3-campaign-config/1",
-        "suite_digest": suite_digest,
-        "source_commit": source_commit,
-        "model": "gpt-5.6-luna",
-        "base_url": "http://localhost:8317/v1",
-        "workers": args.workers,
-    }
+    config = _campaign_config(suite_digest, source_commit)
     campaign_id = _digest(config)
     campaign_root = args.root.resolve() / campaign_id
     campaign_root.mkdir(parents=True, exist_ok=True)
     _atomic_write(campaign_root / "campaign-config.json", {**config, "campaign_id": campaign_id})
 
-    records: list[dict[str, Any]] = []
+    records = _existing_records(
+        campaign_root,
+        campaign_id=campaign_id,
+        suite_digest=suite_digest,
+    )
+    selected_needs = _select_needs_for_run(needs, records, max_new=args.max_new)
+    _append_event(
+        campaign_root / "campaign-events.jsonl",
+        {
+            "event": "campaign_run_started",
+            "at": _utc_now(),
+            "workers": args.workers,
+            "max_new": args.max_new,
+            "selected_need_ids": [item["id"] for item in selected_needs],
+        },
+    )
     with ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix="s1-v3") as executor:
         futures = {
             executor.submit(_run_need, need, campaign_root, suite_digest, campaign_id): need["id"]
-            for need in needs
+            for need in selected_needs
         }
         for future in as_completed(futures):
             need_id = futures[future]
@@ -357,11 +417,11 @@ def main() -> None:
                     }
                 )
                 raise
-            records.append(record)
-            partial = _summary(campaign_id, suite_digest, records)
+            records[need_id] = record
+            partial = _summary(campaign_id, suite_digest, list(records.values()))
             _atomic_write(campaign_root / "summary.partial.json", partial)
-    records.sort(key=lambda item: item["need_id"])
-    summary = _summary(campaign_id, suite_digest, records)
+    ordered_records = sorted(records.values(), key=lambda item: item["need_id"])
+    summary = _summary(campaign_id, suite_digest, ordered_records)
     _atomic_write(campaign_root / "summary.json", summary)
     _print(summary)
 

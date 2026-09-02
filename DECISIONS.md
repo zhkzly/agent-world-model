@@ -318,3 +318,5 @@ as complete JSON leaf diffs plus exact reopen/reset equality. No domain branch,
 Builder self-verdict, Task, answer or reward enters S1 acceptance.
 
 `s1-s2-projection-identity|介入0|返工0|cold Release projection digest→TaskContract exact rename+focused tests|红线违反0`
+
+`qualified-campaign-scheduling|介入0|返工0|serial warmup→same-id parallel resume+mutation licence|红线违反0`
