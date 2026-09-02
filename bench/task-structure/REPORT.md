@@ -63,3 +63,26 @@ Mutation checks independently removed array-position normalization, bypassed the
 effect branch, erased prior-task proposal context, and stopped the sampler from
 forwarding that context. Each mutation made the focused tests fail and restoration
 made them pass.
+
+## Live post-fix campaign
+
+Commit `662c22f` ran a fresh 15-candidate campaign against independently
+regenerated Library Release `6a61f3e0...bc8c0` (campaign
+`91ffc873...896273`). It admitted 10 Tasks with 10 distinct structure IDs and
+rejected five candidates: four failed their fresh checker and one was a real
+duplicate. The admitted set covers successful mutation, multi-step lifecycle,
+two different refusal regimes, state-preserving reconciliation queries, a
+two-checkout capacity transition, borrower handoff, and a mixed
+success/refusal/return trajectory.
+
+Compared with the old campaign's manually corrected 2/15 effective-structure
+yield, the live post-fix yield is 10/15: a 5x increase, or +53.3 percentage
+points. All 10 TaskPacks were copied to a new filesystem root and cold-verified
+with 10 unique package IDs, 10 unique structure IDs, and 20 distinct passing
+witnesses.
+
+The live campaign took 6,235,981 ms and reported 949,384 model tokens and 305
+public tool calls. Its wall time is not a clean latency comparison with the old
+run: it shared the local provider with simultaneous S1 generation, and one
+checker turn visibly queued behind that work. The diversity/yield comparison is
+the supported result; a throughput claim requires a matched-concurrency run.

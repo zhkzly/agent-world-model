@@ -325,7 +325,7 @@ Builder self-verdict, Task, answer or reward enters S1 acceptance.
 
 `s2-task-campaign-handoff|介入0|返工0|cold TaskPack+relocation+resumable records+CorpusManifest+2 mutation licences|红线违反0`
 
-`s2-effect-structure-dedup|介入1|返工1|15-candidate real Library replay: duplicate recall 2/13→13/13; live cross-domain validation pending|红线违反0`
+`s2-effect-structure-dedup|介入1|返工1|old effective 2/15→live 10/15 distinct Library structures; 10 relocated packs/20 witnesses; cross-domain pending|红线违反0`
 
 Task structure is conservatively keyed by normalized protected state-effect
 shape (and refusal outcome when present), not incidental public inspection order,
