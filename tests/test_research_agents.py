@@ -282,6 +282,8 @@ def test_producer_prompt_and_skill_require_agenda_before_search_and_semantic_clo
         assert "every need anchor" in normalized
         assert "precondition" in normalized and "postcondition" in normalized
         assert "prohibited mutation" in normalized
+        assert "publicly exercisable" in normalized
+        assert "external evidence" in normalized and "cannot authorize" in normalized
 
 
 def test_one_provider_turn_ceiling_preserves_the_original_rejection(
@@ -1009,6 +1011,9 @@ def test_reviewer_input_excludes_unshown_store_passages_and_no_bulk_expansion_ex
 
     assert review.requirement_findings[0]["judgment"] == "supported"
     rendered = repr(client.responses.calls[0]["input"])
+    instructions = client.responses.calls[0]["instructions"].lower()
+    assert "publicly testable" in instructions
+    assert "external evidence does not authorize" in instructions
     assert "A confirmed reservation consumes one unit of capacity." in rendered
     assert "The confirmed reservation capacity rule is part of the public policy." in rendered
     assert "Concurrent requests" not in rendered

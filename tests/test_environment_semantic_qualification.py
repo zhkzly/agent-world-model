@@ -200,6 +200,8 @@ def test_semantic_review_uses_narrow_context_and_host_derives_pass() -> None:
         "/reservations/0",
     }
     assert scenario["lifecycle"][0]["state_equal"] is True
+    assert "state_equal" not in scenario["lifecycle"][1]
+    assert scenario["lifecycle"][1]["changed_from_pre_reset"] is True
     assert scenario["lifecycle"][1]["reset_restored_initial"] is True
     assert result.provider_turns == 2
     assert result.usage[0]["total_tokens"] == 120

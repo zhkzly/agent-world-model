@@ -47,7 +47,13 @@ replacement semantic contract.
    external fact remains unsupported after the available Research budget.
 8. Describe capabilities, workflows, invariants, refusals, and meaningful
    initial-world conditions in observable language. Include a falsifiable
-   consequence for each requirement.
+   consequence for each requirement. Every mandatory requirement must be
+   publicly exercisable through a proposed public tool result, public state
+   observation, or the canonical reset/reopen lifecycle. External evidence
+   cannot authorize a stronger product guarantee than the Need. Treat hidden
+   concurrency, interruption, fault injection, and other behavior whose
+   violation cannot be publicly distinguished as a non-blocking limitation,
+   unless the Need explicitly requests it and the public environment can test it.
 9. Disclose assumptions, alternatives, and exclusions. Do not prescribe tools,
    storage tables, implementation modules, Tasks, verifiers, or rewards.
 

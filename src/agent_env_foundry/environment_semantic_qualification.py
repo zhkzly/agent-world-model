@@ -509,6 +509,7 @@ def _review_input(
         "evidence_contract": {
             "state_changes": "complete Host-derived JSON leaf differences",
             "reopen_matches_after": "exact canonical state equality after process reopen",
+            "changed_from_pre_reset": "the reset replaced the immediately preceding state",
             "reset_restored_initial": "exact canonical equality with the scenario initial state",
         },
         "host_executed_evidence": _review_evidence_projection(diagnostic_evidence),
@@ -570,14 +571,20 @@ def _review_evidence_projection(evidence: tuple[JSONObject, ...]) -> JSONObject:
                 "operation": item.get("operation"),
                 "before_digest": sha256_hex(canonical_bytes(before)),
                 "after_digest": sha256_hex(canonical_bytes(after)),
-                "state_equal": canonical_bytes(before) == canonical_bytes(after),
                 "state_changes": cast(JSONValue, json_leaf_changes(before, after)),
             }
             if item.get("operation") == "reset_after_actions":
+                lifecycle_projection["changed_from_pre_reset"] = canonical_bytes(
+                    before
+                ) != canonical_bytes(after)
                 lifecycle_projection["reset_observation"] = item.get("reset_observation")
                 lifecycle_projection["reset_restored_initial"] = canonical_bytes(
                     after
                 ) == canonical_bytes(initial_state)
+            else:
+                lifecycle_projection["state_equal"] = canonical_bytes(before) == canonical_bytes(
+                    after
+                )
             projected_lifecycle.append(lifecycle_projection)
         scenarios.append(
             {
