@@ -563,6 +563,60 @@ def test_responses_request_normalizes_mechanical_zero_argument_schema(
     }
 
 
+def test_responses_request_adds_types_implied_by_answer_consts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    responses = Responses([_call_response()])
+    driver = ResponsesPolicyDriver.from_route(
+        AgentRoute(),
+        client_factory=lambda **_kwargs: Client(responses),
+    )
+    answer_schema = {
+        "type": "object",
+        "properties": {
+            "result": {
+                "type": "object",
+                "properties": {
+                    "available": {"const": True},
+                    "staged": {"const": []},
+                    "paths": {"const": ["README.md", "src/app.py"]},
+                },
+                "required": ["available", "staged", "paths"],
+                "additionalProperties": False,
+            }
+        },
+        "required": ["result"],
+        "additionalProperties": False,
+    }
+    public_input = PublicEpisodeInput(
+        PUBLIC_AGENT_SYSTEM_PROMPT,
+        "Inspect public state.",
+        {},
+        (_tool(),),
+        answer_schema,
+    )
+
+    driver.start(public_input)
+    driver.next_decision(())
+
+    wire = responses.requests[0]["text"]["format"]["schema"]
+    assert wire["properties"]["result"]["properties"]["available"] == {
+        "const": True,
+        "type": "boolean",
+    }
+    assert wire["properties"]["result"]["properties"]["staged"] == {
+        "type": "array",
+        "items": {"type": "string"},
+    }
+    assert wire["properties"]["result"]["properties"]["paths"] == {
+        "type": "array",
+        "items": {"type": "string"},
+    }
+    assert answer_schema["properties"]["result"]["properties"]["available"] == {"const": True}
+    assert answer_schema["properties"]["result"]["properties"]["staged"] == {"const": []}
+
+
 def test_host_rejects_duplicate_call_ids() -> None:
     duplicate = _capture(
         ScriptedDriver(

@@ -77,8 +77,11 @@ object-root Draft 2020-12 final-answer schema and your observed final answer as 
 The checker brief is private input for a later independent code author: state the intended goal,
 required and forbidden effects, answer relation, and any genuinely required process evidence.
 Select only physically meaningful negative categories. The Host will always require no_op and
-wrong_answer and will independently capture protected before/after state; you cannot see or
-define that state and you do not decide whether the Task is admitted.
+wrong_answer. Add the smallest non-redundant extra set: partial only for a genuinely multi-part
+goal, collateral only for an explicit preservation constraint, and wrong_target only when target
+selection is load-bearing and not already covered by another category. The Host independently
+captures protected before/after state; you cannot see or define that state and you do not decide
+whether the Task is admitted.
 """
 
 ProposalFailureKind = Literal[

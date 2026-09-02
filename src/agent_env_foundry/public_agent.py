@@ -249,7 +249,7 @@ class ResponsesPolicyDriver:
                 "format": {
                     "type": "json_schema",
                     "name": "public_episode_answer",
-                    "schema": public["answer_schema"],
+                    "schema": _responses_text_schema(cast(JSONObject, public["answer_schema"])),
                     "strict": True,
                 }
             },
@@ -265,6 +265,67 @@ def _responses_parameters(value: JSONObject) -> JSONObject:
         schema["properties"] = {}
         schema["required"] = []
     return schema
+
+
+def _responses_text_schema(value: JSONObject) -> JSONObject:
+    """Add provider-required type facts already implied by exact const values."""
+
+    schema = cast(JSONObject, json.loads(json.dumps(value, ensure_ascii=False)))
+
+    def visit(node: JSONValue) -> None:
+        if isinstance(node, dict):
+            if "const" in node:
+                constant = node["const"]
+                if isinstance(constant, (dict, list)):
+                    node.pop("const")
+                    for key, child in _json_shape(constant).items():
+                        node.setdefault(key, child)
+                elif "type" not in node:
+                    node["type"] = _json_type(constant)
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(schema)
+    return schema
+
+
+def _json_type(value: JSONValue) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    return "object"
+
+
+def _json_shape(value: JSONValue) -> JSONObject:
+    kind = _json_type(value)
+    if isinstance(value, dict):
+        return {
+            "type": "object",
+            "properties": {key: _json_shape(child) for key, child in value.items()},
+            "required": list(value),
+            "additionalProperties": False,
+        }
+    if isinstance(value, list):
+        item_types = sorted({_json_type(item) for item in value}) or ["string"]
+        items: JSONObject = (
+            {"type": item_types[0]}
+            if len(item_types) == 1
+            else {"anyOf": [{"type": item} for item in item_types]}
+        )
+        return {"type": "array", "items": items}
+    return {"type": kind}
 
 
 def capture_public_episode(

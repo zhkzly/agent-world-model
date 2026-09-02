@@ -290,3 +290,14 @@ only semantic code authority and froze a new Task identity before any witness.
 The sole rework removed an unsupported Responses `uniqueItems` keyword while
 retaining deterministic Host deduplication; no retry, compatibility path,
 domain branch or old `evaluate_atom` dependency was added.
+
+`s1-s2-realignment-cp-f|介入1|返工3|2 real Releases+2 TaskPacks+4 fresh witnesses+applicable physical challenges+6 assessment trials+17 mutation licences|红线违反1`
+
+The first implementation treated all five challenge labels as repeated full
+Agent episodes. The user stopped that over-broad path. Final admission keeps
+universal no-op/wrong-answer, derives partial from a strict successful prefix,
+builds collateral by adding one public effect after a successful replay, and
+uses wrong-target only when declared. Physical counterexamples exposed hidden
+answer serialization and required/forbidden axis coupling before final freeze.
+Library and Git each reached 3/3 separate assessment trials; assessment and
+Corpus identities remain outside TaskPack truth.

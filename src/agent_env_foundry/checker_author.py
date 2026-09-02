@@ -33,6 +33,7 @@ from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.task_contract import (
     CHECKER_FACTORY,
     CandidateTaskContract,
+    TaskCheckRequest,
     TaskCheckResult,
     TaskContract,
     TaskProposalEvidence,
@@ -203,31 +204,6 @@ def execute_checker_project(
     settings: PreparationSettings,
 ) -> tuple[TaskContract, TaskCheckResult]:
     prepared.verify_inputs()
-    actual = compute_checker_project_digest(prepared.root)
-    if actual != checker_project_digest:
-        raise CheckerAuthorFailure(
-            "checker_identity",
-            "checker_digest_mismatch",
-            "checker project bytes differ from the requested identity",
-            expected=checker_project_digest,
-            actual=actual,
-        )
-    runtime = materialize_project(
-        ProjectMaterializationInput(
-            prepared.root,
-            checker_project_digest,
-            "generated_task_checker",
-            (
-                "agent_env_foundry",
-                "generated_environment",
-                "generated_task_semantics",
-                "generated_qualification_verifier",
-            ),
-            "checker",
-        ),
-        Path(runtime_root),
-        settings=settings,
-    )
     task = seal_task_contract(
         prepared.candidate,
         checker_project_digest=checker_project_digest,
@@ -239,6 +215,60 @@ def execute_checker_project(
         after_state=evidence.after_state,
         public_trace=evidence.public_trace,
         final_answer=evidence.proposed_final_answer,
+    )
+    result = execute_task_checker(
+        prepared.root,
+        task=task,
+        request=request,
+        runtime_root=runtime_root,
+        settings=settings,
+    )
+    return task, result
+
+
+def execute_task_checker(
+    checker_project_root: Path,
+    *,
+    task: TaskContract,
+    request: TaskCheckRequest,
+    runtime_root: Path,
+    settings: PreparationSettings,
+) -> TaskCheckResult:
+    """Execute one frozen checker over any Host-constructed Task request."""
+
+    if not isinstance(task, TaskContract) or not isinstance(request, TaskCheckRequest):
+        raise TypeError("checker execution requires typed TaskContract and TaskCheckRequest")
+    if request.task_id != task.task_id:
+        raise CheckerAuthorFailure(
+            "checker_contract",
+            "checker_request_task_mismatch",
+            "checker request belongs to another Task",
+        )
+    project_root = Path(checker_project_root)
+    actual = compute_checker_project_digest(project_root)
+    if actual != task.checker_project_digest:
+        raise CheckerAuthorFailure(
+            "checker_identity",
+            "checker_digest_mismatch",
+            "checker project bytes differ from the TaskContract identity",
+            expected=task.checker_project_digest,
+            actual=actual,
+        )
+    runtime = materialize_project(
+        ProjectMaterializationInput(
+            project_root,
+            task.checker_project_digest,
+            "generated_task_checker",
+            (
+                "agent_env_foundry",
+                "generated_environment",
+                "generated_task_semantics",
+                "generated_qualification_verifier",
+            ),
+            "checker",
+        ),
+        Path(runtime_root),
+        settings=settings,
     )
     before_digest = compute_checker_project_digest(runtime.project_root)
     transport = _ChildTransport(
@@ -267,7 +297,7 @@ def execute_checker_project(
             "checker_source_mutation",
             "checker execution changed its frozen project bytes",
         )
-    return task, first
+    return first
 
 
 def run_checker_author(
@@ -596,6 +626,7 @@ __all__ = [
     "PreparedCheckerWorkspace",
     "compute_checker_project_digest",
     "execute_checker_project",
+    "execute_task_checker",
     "prepare_checker_author_workspace",
     "repair_checker_author",
     "run_checker_author",

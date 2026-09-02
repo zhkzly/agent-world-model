@@ -46,6 +46,19 @@ valid execution that satisfies those predicates; never require equality with
 the proposal trace, exact call count, incidental ordering, or one reference
 answer serialization.
 
+The proposal's final answer is one positive example, not a hidden refinement
+of the public schema. A value or representation that the public schema allows
+may be rejected only when the public instruction or checker brief supplies the
+semantic distinction. Do not infer additional required values from the one
+proposal serialization.
+
+Keep the five axes causally separable. Required-effects asks whether the target
+effect occurred; process asks whether genuinely required target actions were
+observed. Extra files, records, commits, or later unrelated actions belong to
+forbidden-effects and must not retroactively make the target required/process
+facts false. This separation is what makes a physical collateral challenge
+possible.
+
 The checker is pure and deterministic. It must not import or execute the actor,
 the Host package, TaskSemantics, another verifier, an LLM, network, subprocess,
 filesystem, environment variables, wall clock, randomness, or mutable global

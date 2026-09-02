@@ -177,6 +177,7 @@ def test_direct_proposal_uses_public_tools_and_host_captures_protected_evidence(
     assert result.evidence.public_trace[0]["tool"] == "increment"
     first_input = repr(client.responses.calls[0]["input"])
     proposal_schema = client.responses.calls[0]["text"]["format"]["schema"]
+    assert "smallest non-redundant extra set" in client.responses.calls[0]["instructions"]
     assert "before_state" not in first_input
     assert "after_state" not in first_input
     assert "checker_brief" not in first_input
