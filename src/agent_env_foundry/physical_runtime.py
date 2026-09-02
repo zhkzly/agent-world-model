@@ -39,11 +39,18 @@ PreparationFailureKind = Literal[
     "InfrastructureFailure",
     "SemanticsDefect",
     "VerifierDefect",
+    "CheckerDefect",
 ]
 _PREPARATION_FAILURE_KINDS = frozenset(
-    {"EnvironmentDefect", "InfrastructureFailure", "SemanticsDefect", "VerifierDefect"}
+    {
+        "EnvironmentDefect",
+        "InfrastructureFailure",
+        "SemanticsDefect",
+        "VerifierDefect",
+        "CheckerDefect",
+    }
 )
-_PROJECT_ROLES = frozenset({"actor", "semantics", "verifier"})
+_PROJECT_ROLES = frozenset({"actor", "semantics", "verifier", "checker"})
 
 
 class PreparationContractError(ValueError):
@@ -155,7 +162,7 @@ class _ChildTransport:
         *,
         cwd: Path,
         timeout: float,
-        role: Literal["actor", "semantics"],
+        role: Literal["actor", "semantics", "checker"],
     ) -> None:
         environment = dict(os.environ)
         for name in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
@@ -222,7 +229,7 @@ class _ChildTransport:
             error = response["error"]
             message = error.get("message") if isinstance(error, dict) else str(error)
             raise PreparationExecutionError(
-                "EnvironmentDefect" if self._role == "actor" else "SemanticsDefect",
+                _child_defect(self._role),
                 "child_call_failed",
                 f"child {operation} failed: {message}",
                 operation=operation,
@@ -253,9 +260,7 @@ class _ChildTransport:
         status = self._process.poll()
         stderr = self._stderr.read() if status is not None else ""
         if code in {"child_exited", "child_transport_failed"} and self._next_seq == 2:
-            kind: PreparationFailureKind = (
-                "EnvironmentDefect" if self._role == "actor" else "SemanticsDefect"
-            )
+            kind: PreparationFailureKind = _child_defect(self._role)
             code = "child_startup_failed"
         else:
             kind = "InfrastructureFailure"
@@ -615,7 +620,17 @@ def _role_defect(role: ProjectRole) -> PreparationFailureKind:
         return "EnvironmentDefect"
     if role == "semantics":
         return "SemanticsDefect"
-    return "VerifierDefect"
+    if role == "verifier":
+        return "VerifierDefect"
+    return "CheckerDefect"
+
+
+def _child_defect(role: Literal["actor", "semantics", "checker"]) -> PreparationFailureKind:
+    if role == "actor":
+        return "EnvironmentDefect"
+    if role == "semantics":
+        return "SemanticsDefect"
+    return "CheckerDefect"
 
 
 def _module_name(reference: str) -> str:

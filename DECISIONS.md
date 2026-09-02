@@ -281,3 +281,12 @@ Framework owns execution, schema validation, refusal atomicity, two-instance
 replay and reopen. Exact keys prohibit instructions, answers, rewards,
 checkers, witnesses and admission claims, so this strengthens S1 mechanics
 without creating Task truth or a second verifier authority.
+
+`s1-s2-realignment-cp-e|介入0|返工1|real v3 Release+5-turn/9-tool proposal+Codex checker+8 mutation licences+572 full tests|红线违反0`
+
+The proposal policy saw only public Need/Brief/reset/tool material while Host
+captured protected state. One immutable checker project became the candidate's
+only semantic code authority and froze a new Task identity before any witness.
+The sole rework removed an unsupported Responses `uniqueItems` keyword while
+retaining deterministic Host deduplication; no retry, compatibility path,
+domain branch or old `evaluate_atom` dependency was added.

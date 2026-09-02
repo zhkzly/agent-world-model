@@ -410,6 +410,7 @@ def test_only_the_four_approved_runtime_skills_are_packaged() -> None:
         "research",
         "environment-codegen",
         "qualification-verifier-codegen",
+        "task-checker-codegen",
         "task-semantics-codegen",
     }
     assert Path(skill.path) in skill_files
