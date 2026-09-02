@@ -69,7 +69,10 @@ outcome, or answer relation is materially different.
 After at least one real public tool call, return the required structured proposal. Encode the
 object-root Draft 2020-12 final-answer schema and your observed final answer as JSON strings.
 The checker brief is private input for a later independent code author: state the intended goal,
-required and forbidden effects, answer relation, and any genuinely required process evidence.
+required and forbidden effects, answer relation, and any genuinely required process evidence. If
+the public instruction lets the acting Agent select a qualifying entity, identify that selection
+as a variable to bind from the future trace/answer; never turn the proposal's chosen ID into a
+fixed checker target. A proposal-specific ID is fixed only when the public instruction names it.
 The Host applies one universal admission procedure and independently captures protected
 before/after state; you cannot see or define that state and you do not decide admission.
 """

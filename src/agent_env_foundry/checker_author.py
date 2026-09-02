@@ -167,7 +167,7 @@ def run_checker_checks(
     config: BuilderConfig,
 ) -> tuple[CommandResult, ...]:
     prepared.verify_inputs()
-    source = _source_check(prepared.root)
+    source = _source_check(prepared)
     if not source.passed:
         return (source,)
     results: list[CommandResult] = [source]
@@ -438,7 +438,12 @@ def _drive_checker(
     )
 
 
-def _source_check(root: Path) -> CommandResult:
+def _source_check(prepared: PreparedCheckerWorkspace) -> CommandResult:
+    root = prepared.root
+    forbidden_identifiers = _proposal_only_identifiers(
+        prepared.candidate,
+        prepared.proposal_evidence,
+    )
     violations: list[dict[str, Any]] = []
     source_root = root / "src/generated_task_checker"
     if not (source_root / "release.py").is_file():
@@ -465,6 +470,17 @@ def _source_check(root: Path) -> CommandResult:
             violations.append({"path": relative, "reason": f"forbidden_import:{name}"})
         for node in ast.walk(tree):
             if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value in forbidden_identifiers
+            ):
+                violations.append(
+                    {
+                        "path": relative,
+                        "reason": f"proposal_identifier_hardcoded:{node.value}",
+                    }
+                )
+            if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id
@@ -482,6 +498,32 @@ def _source_check(root: Path) -> CommandResult:
         "" if violations else "checker source contract passed",
         json.dumps(violations, ensure_ascii=False, sort_keys=True) if violations else "",
     )
+
+
+def _proposal_only_identifiers(
+    candidate: CandidateTaskContract,
+    evidence: TaskProposalEvidence,
+) -> frozenset[str]:
+    values: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if (
+                    isinstance(key, str)
+                    and (key == "id" or key.endswith("_id"))
+                    and isinstance(child, str)
+                ):
+                    values.add(child)
+                collect(child)
+        elif isinstance(value, list | tuple):
+            for child in value:
+                collect(child)
+
+    collect(evidence.reset_observation)
+    collect(evidence.public_trace)
+    collect(evidence.proposed_final_answer)
+    return frozenset(value for value in values if value not in candidate.instruction)
 
 
 def _checker_contract_check(

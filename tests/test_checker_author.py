@@ -170,6 +170,8 @@ def test_checker_inputs_are_frozen_and_excluded_from_project_identity(tmp_path: 
     assert all(
         (prepared.root / name).stat().st_mode & 0o222 == 0 for name in prepared.input_digests
     )
+    contract = (prepared.root / "TASK_CHECKER_CONTRACT.md").read_text(encoding="utf-8")
+    assert "identifier selected only by proposal evidence" in contract
     (prepared.root / "CANDIDATE_TASK_CONTRACT.json").chmod(0o644)
     (prepared.root / "CANDIDATE_TASK_CONTRACT.json").write_text("{}")
     assert compute_checker_project_digest(prepared.root) == first
@@ -236,3 +238,42 @@ def test_checker_source_cannot_import_actor_or_host(tmp_path: Path) -> None:
     assert checks[0].phase == "source_contract"
     assert not checks[0].passed
     assert "forbidden_import" in checks[0].stderr
+
+
+def test_checker_cannot_hardcode_proposal_id_when_instruction_leaves_selection_open(
+    tmp_path: Path,
+) -> None:
+    evidence = _evidence()
+    candidate = CandidateTaskContract(
+        "candidate-task-contract/1",
+        evidence.release_id,
+        "2" * 64,
+        evidence.reset_start,
+        "Approve one publicly submitted request and report the selected request and status.",
+        {
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+                "status": {"type": "string"},
+            },
+            "required": ["request_id", "status"],
+            "additionalProperties": False,
+        },
+        "Bind the selected request from the public trace; the proposal used req-1.",
+        evidence.evidence_id,
+    )
+    prepared = prepare_checker_author_workspace(
+        tmp_path / "checker",
+        candidate=candidate,
+        proposal_evidence=evidence,
+    )
+    _valid_project(prepared.root)
+
+    checks = run_checker_checks(
+        prepared,
+        BuilderConfig(uv_cache_dir=tmp_path / "uv-cache"),
+    )
+
+    assert checks[0].phase == "source_contract"
+    assert not checks[0].passed
+    assert "proposal_identifier_hardcoded:req-1" in checks[0].stderr

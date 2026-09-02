@@ -10,10 +10,15 @@ description: Author one pure task-specific checker from a frozen candidate and r
 2. Translate the protected `checker_brief` into explicit ordinary Python over
    before state, after state, public trace, and final answer.
 3. Use proposal evidence to understand concrete state shape and one feasible
-   execution, but do not compare future traces with that proposal.
+   execution, but do not compare future traces with that proposal. When the
+   public instruction leaves entity selection open, bind selected IDs from each
+   future request's trace/final answer and validate their relations; never copy
+   the proposal's selected IDs into checker constants.
 4. Keep required effects, forbidden effects, answer and process axes separate;
    `passed` must be their conjunction.
-5. Accept alternative valid tool sequences and irrelevant ordering differences.
+5. Accept alternative valid entity choices, tool sequences, and irrelevant
+   ordering differences. Only an identifier explicitly fixed by the public
+   instruction may be a checker constant.
 6. Add a positive, no-op and wrong-answer test plus ordinary semantic unit
    tests appropriate to this task. Run the project commands,
    and repair all factual failures. Framework checks—not your final response—

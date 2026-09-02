@@ -177,6 +177,7 @@ def test_direct_proposal_uses_public_tools_and_host_captures_protected_evidence(
     assert "checker_brief" not in first_input
     assert "Increase a counter by one and report it." in first_input
     assert "wording" in client.responses.calls[0]["instructions"]
+    assert "fixed checker target" in client.responses.calls[0]["instructions"]
     assert "challenge_categories" not in proposal_schema["properties"]
 
 

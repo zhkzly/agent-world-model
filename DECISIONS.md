@@ -344,3 +344,11 @@ construction. A 26-Candidate/29-ToolSpec preflight found exactly the two known
 bare arrays and no further wire-shape failure. The exact model result is still validated
 against the original schema, so the adapter cannot turn an invalid answer into a
 passing Task.
+
+`checker-open-selection-binding|介入1|返工1|real Candidate4 proposal-only ID literals rejected; three non-overfit checker sources allowed+3 mutation licences|红线违反0`
+
+When a public instruction leaves entity choice open, the checker must bind that
+choice from the evaluated trace/final answer. Host source checks reject an ID
+literal that appears in proposal public evidence but not in the public
+instruction; explicitly named targets remain legal. Proposal and checker Skills
+state the same rule so factual feedback repairs the responsible checker project.

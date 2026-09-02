@@ -51,6 +51,13 @@ the Host package, TaskSemantics, another verifier, an LLM, network, subprocess,
 filesystem, environment variables, wall clock, randomness, or mutable global
 state. It receives all authority through the request.
 
+Proposal evidence demonstrates one feasible binding, not the only valid entity
+choice. If the public instruction says to select or choose a qualifying entity,
+derive that binding from the evaluated request's public trace and final answer,
+then check its preconditions and effects in before/after state. Do not embed an
+identifier selected only by proposal evidence as a source constant. An exact ID
+may be constant only when the public instruction itself names that ID.
+
 Write meaningful tests for the supplied positive example, an unchanged no-op
 and a schema-valid wrong answer. Add ordinary task-specific semantic unit tests
 when useful, but do not create an adversarial execution pipeline or additional
