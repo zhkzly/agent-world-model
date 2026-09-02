@@ -232,6 +232,41 @@ class TrustedCallEvent:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class StateSnapshotEvent:
+    seq: int
+    request_digest: str
+    response_digest: str
+    before_tree_digest: str
+    after_tree_digest: str
+
+    def __post_init__(self) -> None:
+        if self.seq <= 0:
+            raise PreparationContractError("state snapshot seq must be positive")
+        for name in (
+            "request_digest",
+            "response_digest",
+            "before_tree_digest",
+            "after_tree_digest",
+        ):
+            _digest(getattr(self, name), name)
+
+    @property
+    def unchanged(self) -> bool:
+        return self.before_tree_digest == self.after_tree_digest
+
+    def to_document(self) -> JSONObject:
+        return {
+            "seq": self.seq,
+            "operation": "read_state",
+            "request_digest": self.request_digest,
+            "response_digest": self.response_digest,
+            "before_tree_digest": self.before_tree_digest,
+            "after_tree_digest": self.after_tree_digest,
+            "unchanged": self.unchanged,
+        }
+
+
 @runtime_checkable
 class PreparedSession(Protocol):
     identity: PreparedSessionIdentity
@@ -409,6 +444,80 @@ class _ChildTransport:
             stderr=stderr,
             cause=f"{type(cause).__name__}: {cause}" if cause else None,
         )
+
+
+class StateSnapshotProxy:
+    """Host-only, task-neutral state readback over one frozen actor project."""
+
+    def __init__(
+        self,
+        transport: _ChildTransport,
+        *,
+        state_schema: JSONObject,
+        events: list[StateSnapshotEvent],
+    ) -> None:
+        self._transport = transport
+        self._state_schema = state_schema
+        self._events = events
+        self._accepted_by_tree: dict[str, str] = {}
+
+    def read(self, instance_directory: Path) -> JSONValue:
+        requested = Path(instance_directory)
+        if requested.is_symlink() or not requested.is_dir():
+            raise PreparationContractError(
+                "state snapshot instance_directory must be a real directory"
+            )
+        instance = requested.resolve()
+        before = tree_manifest(instance)
+        failure: PreparationExecutionError | None = None
+        try:
+            value = self._transport.call("read", {"instance_directory": str(instance)})
+            response_document: JSONValue = value
+        except PreparationExecutionError as exc:
+            failure = exc
+            response_document = {
+                "kind": exc.kind,
+                "code": exc.code,
+                "message": str(exc),
+            }
+            value = None
+        after = tree_manifest(instance)
+        response_digest = _sha(canonical_bytes(response_document))
+        event = StateSnapshotEvent(
+            len(self._events) + 1,
+            _sha(canonical_bytes({"before_tree_digest": before.digest})),
+            response_digest,
+            before.digest,
+            after.digest,
+        )
+        self._events.append(event)
+        if not event.unchanged:
+            raise PreparationExecutionError(
+                "EnvironmentDefect",
+                "state_snapshot_mutation",
+                "protected state reader mutated the native instance",
+            ) from failure
+        if failure is not None:
+            raise failure
+        try:
+            validate_instance(value, self._state_schema, role="protected state snapshot")
+        except SchemaError as exc:
+            raise PreparationExecutionError(
+                "EnvironmentDefect",
+                "state_snapshot_schema",
+                str(exc),
+            ) from exc
+        previous = self._accepted_by_tree.setdefault(before.digest, response_digest)
+        if previous != response_digest:
+            raise PreparationExecutionError(
+                "EnvironmentDefect",
+                "state_snapshot_nondeterministic",
+                "unchanged native bytes produced different protected state snapshots",
+            )
+        return value
+
+    def close(self) -> None:
+        self._transport.close(operation="close")
 
 
 class ActorProxy:

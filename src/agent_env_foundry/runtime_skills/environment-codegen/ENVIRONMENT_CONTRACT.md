@@ -17,6 +17,16 @@ invoke(tool_name: str, arguments: dict) -> ToolObservation
 close() -> None
 ```
 
+The same project also exposes the fixed protected entrypoint:
+
+```python
+generated_environment.release:read_state(instance_directory) -> JSONValue
+```
+
+`read_state` reads real persistent bytes without mutation and returns a
+deterministic, task-neutral state projection. It does not declare capabilities,
+goals, answers, checkers or rewards and is never a public Agent tool.
+
 Every `ToolSpec` returned by `tools()` is a plain mapping with exactly the keys
 `name`, `description`, Draft 2020-12 `input_schema`, and Draft 2020-12
 `output_schema` — never a dataclass or object requiring attribute access. Every
@@ -77,14 +87,21 @@ self-contained Draft 2020-12 start schema at `docs/schemas/start.json` and reset
 observation schema at `docs/schemas/reset.json`. These exact mechanical paths
 let the Host stage one unambiguous public surface; schema meaning remains the
 Builder's domain decision.
-Do not write `release.json`, `payload-manifest.json`, qualification receipts or
-digests. The Host combines this project with the independently authored
-TaskSemantics project and creates the sole EnvironmentRelease v2 descriptor.
+Use the fixed `generated_environment.release:read_state` protected entrypoint
+and publish its self-contained schema at `docs/schemas/state.json`. Every
+persistent entity/relation needed to distinguish real state transitions must be
+observable there, with deterministic ordering where collections are unordered.
+Do not write `release.json`, `payload-manifest.json`, conformance receipts or
+digests. The Host creates the sole EnvironmentRelease/3 descriptor.
 
 ## Project quality
 
 Include meaningful package data, diagnostic tests, `uv.lock`, and all declared
 dependencies. Tests must exercise multi-step state changes and a refusal with no
-prohibited mutation. A dictionary response map, canned result, mock backend,
-empty world, repository template, Task, verifier, reward, trajectory, MCP, HTTP,
-or training-specific behavior does not satisfy this contract.
+prohibited mutation. The diagnostic matrix must execute every public tool at
+least once on a representative real success or refusal and validate the full
+returned envelope against that tool's exact ToolSpec; checking selected business
+fields without schema validation is insufficient. A dictionary response map,
+canned result, mock backend, empty world, repository template, Task, verifier,
+reward, trajectory, MCP, HTTP, or training-specific behavior does not satisfy
+this contract.

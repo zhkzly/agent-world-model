@@ -235,3 +235,10 @@ Qualification-local copy was deleted; no source rule or admission gate changed.
 Checkpoint A changes product/spec authority and adds an unexported pure v3
 descriptor contract only. Public release/generation/preparation behavior stays
 v2 until the atomic Checkpoint C cutover; no compatibility reader was added.
+
+`s1-s2-realignment-cp-b|介入0|返工1|real Codex actor+physical refusal/mutation/reopen/readback+7 mutation licences+522 full tests|红线违反0`
+
+Checkpoint B adds one task-neutral state reader in the actor project, one
+stdlib child and one Host proxy. The first real boundary caught and repaired a
+schema lie that business assertions would otherwise miss; no Release or Task
+path was switched.

@@ -31,6 +31,8 @@ __all__ = [
     "CommandResult",
     "PreparedBuilderWorkspace",
     "RESET_OBSERVATION_SCHEMA_PATH",
+    "STATE_READER_FACTORY",
+    "STATE_SCHEMA_PATH",
     "START_SCHEMA_PATH",
     "candidate_files",
     "compute_candidate_digest",
@@ -42,8 +44,10 @@ __all__ = [
 PROJECTION_NAME = "BUILDER_PROJECTION.json"
 CONTRACT_NAME = "ENVIRONMENT_CONTRACT.md"
 ACTOR_FACTORY = "generated_environment.release:make_environment"
+STATE_READER_FACTORY = "generated_environment.release:read_state"
 START_SCHEMA_PATH = Path("docs/schemas/start.json")
 RESET_OBSERVATION_SCHEMA_PATH = Path("docs/schemas/reset.json")
+STATE_SCHEMA_PATH = Path("docs/schemas/state.json")
 _CODEX_PROVIDER_ID = "foundry_runtime"
 _AMBIENT_PYTHON_ENV = ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME")
 
@@ -298,6 +302,7 @@ def _public_contract_check(root: Path) -> CommandResult:
     for relative, object_root_required in (
         (START_SCHEMA_PATH, True),
         (RESET_OBSERVATION_SCHEMA_PATH, False),
+        (STATE_SCHEMA_PATH, False),
     ):
         path = root / relative
         if path.is_symlink() or not path.is_file():

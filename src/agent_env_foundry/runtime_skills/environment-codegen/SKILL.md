@@ -26,21 +26,28 @@ input file.
    public leaf in the reset/tool output schemas. Execute state changes against native
    persistent state in the assigned instance directory. Never return canned
    success or maintain load-bearing state only in process memory.
-5. Implement the complete actor project, public schemas/documentation, package
-   data, and diagnostic tests. Do not write release or qualification metadata;
-   the Host assembles the actor and TaskSemantics projects into EnvironmentRelease v2.
-   Document the native storage layout needed by independent read-only code
-   authors, but do not write TaskSemantics or Qualification Verifier code.
+5. Implement `generated_environment.release:read_state(instance_directory)` as
+   a protected, task-neutral, read-only projection of real persistent state and
+   describe it with `docs/schemas/state.json`. It must not define capabilities,
+   success, reward or a Task distribution, and it must never mutate the instance.
+6. Implement the complete actor project, public/protected schemas/documentation,
+   package data, and diagnostic tests. Do not write release, conformance or Task
+   metadata; the Host assembles EnvironmentRelease/3. Do not write TaskSemantics,
+   a Task checker or a Qualification Verifier.
    Include tests for native state change, multi-step value reuse, refusal
    without prohibited mutation, reset, reload, instance isolation, and the
-   absence of complete query-answer leakage from reset.
-6. Declare and lock every runtime and test dependency yourself in the project's
+   absence of complete query-answer leakage from reset. Tests must also prove
+   `read_state` schema conformance, deterministic repeated reads and no mutation.
+   For every public tool, execute at least one representative real observation
+   and validate its complete success or refusal envelope against that exact
+   ToolSpec; business assertions alone do not prove schema conformance.
+7. Declare and lock every runtime and test dependency yourself in the project's
    `pyproject.toml` and `uv.lock` (test tools such as a test runner belong in a
    dev dependency group). Install and run through the project's own uv
    environment; the host executes tests only with this project's
    `.venv/bin/python`, so a dependency missing from the locked project fails
    factually. No framework template or dependency list exists to inherit.
-7. Run real uv lock, tests, and build commands. Repair the project from factual
+8. Run real uv lock, tests, and build commands. Repair the project from factual
    command output. Do not weaken the projection or contract to make checks pass.
 
 Do not create Tasks, rewards, verifiers, trajectories, MCP/HTTP transports,

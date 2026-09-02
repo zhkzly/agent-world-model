@@ -94,6 +94,7 @@ def test_prepare_workspace_has_no_domain_source_and_one_projection(
         "tools",
         "invoke",
         "close",
+        "read_state",
         "ToolObservation",
         "instance directory",
         "prohibited mutation",
@@ -509,6 +510,7 @@ def _candidate_root(tmp_path: Path, name: str) -> Path:
     schema = json.dumps({"type": "object"})
     (schemas / "start.json").write_text(schema)
     (schemas / "reset.json").write_text(schema)
+    (schemas / "state.json").write_text(schema)
     return root
 
 
@@ -574,6 +576,7 @@ def test_candidate_checks_reject_noncanonical_schema_handoff_paths(
     schemas = root / "docs/schemas"
     (schemas / "start.json").rename(schemas / "reset_start.schema.json")
     (schemas / "reset.json").rename(schemas / "reset_observation.schema.json")
+    (schemas / "state.json").rename(schemas / "world_state.schema.json")
 
     results = run_candidate_checks(
         root,
@@ -585,11 +588,16 @@ def test_candidate_checks_reject_noncanonical_schema_handoff_paths(
     assert not public_contract.passed
     assert "docs/schemas/start.json" in public_contract.stderr
     assert "docs/schemas/reset.json" in public_contract.stderr
+    assert "docs/schemas/state.json" in public_contract.stderr
 
 
 _CONTRACT_PATH = (
     Path(__file__).resolve().parents[1]
     / "src/agent_env_foundry/runtime_skills/environment-codegen/ENVIRONMENT_CONTRACT.md"
+)
+_SKILL_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "src/agent_env_foundry/runtime_skills/environment-codegen/SKILL.md"
 )
 
 
@@ -601,11 +609,23 @@ def test_contract_document_keeps_release_assembly_out_of_builder() -> None:
     assert "every accepted workflow precondition" in text
     assert "hidden setup" in text
     assert "generated_environment.release:make_environment" in text
+    assert "generated_environment.release:read_state" in text
     assert "`docs/schemas/start.json`" in text
     assert "`docs/schemas/reset.json`" in text
+    assert "`docs/schemas/state.json`" in text
+    assert "task-neutral" in text
+    assert "execute every public tool" in text
+    assert "exact ToolSpec" in text
     assert "Do not write `release.json`" in text
-    assert "Host combines this project" in text
-    assert "EnvironmentRelease v2" in text
+    assert "Host creates the sole EnvironmentRelease/3 descriptor" in text
+
+
+def test_environment_codegen_skill_requires_complete_tool_schema_matrix() -> None:
+    text = " ".join(_SKILL_PATH.read_text(encoding="utf-8").split())
+    assert "For every public tool" in text
+    assert "complete success or refusal envelope" in text
+    assert "against that exact ToolSpec" in text
+    assert "read_state" in text and "task-neutral" in text
 
 
 def test_candidate_identity_binds_post_lock_bytes(
