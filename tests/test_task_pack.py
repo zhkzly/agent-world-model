@@ -162,3 +162,127 @@ def test_task_pack_rejects_document_and_checker_tamper(tmp_path: Path) -> None:
     (root / "checker/src/generated_task_checker/__init__.py").write_text("TAMPERED = True\n")
     with pytest.raises(ValueError, match="checker"):
         verify_task_pack(root, expected_id=pack_id)
+
+
+def _structure_case(
+    *,
+    instruction: str,
+    before: dict,
+    after: dict,
+    tools: tuple[str, ...],
+    answer_fields: tuple[str, ...],
+    error_code: str | None = None,
+) -> tuple[CandidateTaskContract, TaskProposalEvidence]:
+    trace = tuple(
+        {
+            "tool": tool,
+            "arguments": {},
+            "observation": {
+                "ok": error_code is None,
+                "data": {} if error_code is None else None,
+                "error": None if error_code is None else {"code": error_code, "message": "x"},
+            },
+        }
+        for tool in tools
+    )
+    evidence = TaskProposalEvidence(
+        "task-proposal-evidence/1",
+        "1" * 64,
+        None,
+        {},
+        before,
+        after,
+        trace,
+        {field: "value" for field in answer_fields},
+    )
+    schema = {
+        "type": "object",
+        "properties": {field: {"type": "string"} for field in answer_fields},
+        "required": list(answer_fields),
+        "additionalProperties": False,
+    }
+    candidate = CandidateTaskContract(
+        "candidate-task-contract/1",
+        "1" * 64,
+        "2" * 64,
+        None,
+        instruction,
+        schema,
+        "Check the requested public outcome.",
+        evidence.evidence_id,
+    )
+    return candidate, evidence
+
+
+def test_structure_id_collapses_checkout_paraphrase_parameter_and_report_variants() -> None:
+    # Regression distilled from the real Library warmup packs 63f7dd62, 7b6cba94,
+    # 58476452, fbe5b7f1, and ff159d3e: all performed one checkout.
+    first = _structure_case(
+        instruction="Check out an available book and report the active loan.",
+        before={"books": [{"status": "available"}, {"status": "available"}], "loans": []},
+        after={"books": [{"status": "checked_out"}, {"status": "available"}], "loans": [{}]},
+        tools=("list_books", "checkout_book", "inspect_book"),
+        answer_fields=("book_id", "loan_id", "active_loan"),
+    )
+    paraphrase = _structure_case(
+        instruction="Select one borrowable title, borrow it, and return the resulting identifiers.",
+        before={"books": [{"status": "available"}, {"status": "available"}], "loans": []},
+        after={"books": [{"status": "checked_out"}, {"status": "available"}], "loans": [{}]},
+        tools=("inspect_book", "list_books", "checkout_book", "list_active_loans"),
+        answer_fields=("selected_book", "new_loan", "success"),
+    )
+    parameter_variant = _structure_case(
+        instruction="Check out a different available book and report the active loan.",
+        before={"books": [{"status": "available"}, {"status": "available"}], "loans": []},
+        after={"books": [{"status": "available"}, {"status": "checked_out"}], "loans": [{}]},
+        tools=("list_books", "checkout_book", "inspect_book"),
+        answer_fields=("book_id", "loan_id", "active_loan"),
+    )
+
+    assert task_structure_id(*first) == task_structure_id(*paraphrase)
+    assert task_structure_id(*first) == task_structure_id(*parameter_variant)
+
+
+def test_structure_id_keeps_distinct_transition_and_refusal_outcomes() -> None:
+    checkout = _structure_case(
+        instruction="Check out an available book.",
+        before={"books": [{"status": "available", "history": []}], "loans": []},
+        after={"books": [{"status": "checked_out", "history": ["loan"]}], "loans": [{}]},
+        tools=("checkout_book",),
+        answer_fields=("loan_id",),
+    )
+    checkout_and_return = _structure_case(
+        instruction="Check out and return an available book.",
+        before={"books": [{"status": "available", "history": []}], "loans": []},
+        after={"books": [{"status": "available", "history": ["loan"]}], "loans": [{}]},
+        tools=("checkout_book", "return_book"),
+        answer_fields=("loan_id",),
+    )
+    unavailable = _structure_case(
+        instruction="Attempt an unavailable checkout and report the refusal.",
+        before={"books": [{"status": "checked_out"}]},
+        after={"books": [{"status": "checked_out"}]},
+        tools=("checkout_book",),
+        answer_fields=("error",),
+        error_code="BOOK_UNAVAILABLE",
+    )
+    ineligible = _structure_case(
+        instruction="Attempt an ineligible checkout and report the refusal.",
+        before={"books": [{"status": "available"}]},
+        after={"books": [{"status": "available"}]},
+        tools=("checkout_book",),
+        answer_fields=("error",),
+        error_code="PATRON_INELIGIBLE",
+    )
+    unavailable_paraphrase = _structure_case(
+        instruction="Show that an unavailable title cannot be borrowed.",
+        before={"books": [{"status": "checked_out"}]},
+        after={"books": [{"status": "checked_out"}]},
+        tools=("checkout_book", "checkout_book"),
+        answer_fields=("code", "state_unchanged"),
+        error_code="BOOK_UNAVAILABLE",
+    )
+
+    assert task_structure_id(*checkout) != task_structure_id(*checkout_and_return)
+    assert task_structure_id(*unavailable) == task_structure_id(*unavailable_paraphrase)
+    assert task_structure_id(*unavailable) != task_structure_id(*ineligible)

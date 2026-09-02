@@ -105,7 +105,7 @@ class BuilderFailure(RuntimeError):
 @dataclass(frozen=True)
 class BuilderConfig:
     model: str = "gpt-5.6-luna"
-    max_turns: int = 3
+    max_turns: int = 4
     uv_cache_dir: Path = Path("/tmp/agent-env-foundry-builder-uv-cache")
     command_timeout_seconds: float = 300.0
 
@@ -543,7 +543,9 @@ def _feedback(checks: tuple[CommandResult, ...]) -> str:
     return (
         "The deterministic host checks rejected the current candidate. Repair the same "
         "workspace without editing BUILDER_PROJECTION.json or ENVIRONMENT_CONTRACT.md. "
-        "Complete factual failures:\n" + json.dumps(failed, ensure_ascii=False, sort_keys=True)
+        "Treat every listed failure and every nested finding as a completion checklist; do not "
+        "report completion after repairing only a subset. Complete factual failures:\n"
+        + json.dumps(failed, ensure_ascii=False, sort_keys=True)
     )
 
 

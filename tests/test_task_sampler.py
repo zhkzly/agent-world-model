@@ -26,6 +26,7 @@ def test_sampler_rejects_one_candidate_then_continues_without_pressure_pipeline(
             candidate=Document(
                 candidate_id="2" * 64,
                 reset_start=None,
+                instruction="Increment the counter and report the result.",
                 final_answer_schema={"type": "object", "properties": {}},
                 document={"candidate": True},
             ),
@@ -131,15 +132,18 @@ def test_sampler_without_target_exhausts_budget_and_deduplicates_before_checker(
 ) -> None:
     proposed_tools = iter(("inspect", "inspect", "mutate"))
     proposal_index = 0
+    prior_contexts = []
 
     def propose(*args, **kwargs):
         nonlocal proposal_index
         proposal_index += 1
+        prior_contexts.append(kwargs["prior_accepted_instructions"])
         tool = next(proposed_tools)
         return SimpleNamespace(
             candidate=Document(
                 candidate_id=str(proposal_index) * 64,
                 reset_start=None,
+                instruction=f"objective-{proposal_index}",
                 final_answer_schema={
                     "type": "object",
                     "properties": {"result": {"type": "string"}},
@@ -149,7 +153,7 @@ def test_sampler_without_target_exhausts_budget_and_deduplicates_before_checker(
             evidence=Document(
                 public_trace=({"tool": tool, "arguments": {}, "observation": {}},),
                 before_state={"value": 0},
-                after_state={"value": 1},
+                after_state=({"value": 1} if proposal_index < 3 else {"value": 0, "other": 1}),
                 document={"evidence": proposal_index},
             ),
             provider_turns=1,
@@ -219,3 +223,4 @@ def test_sampler_without_target_exhausts_budget_and_deduplicates_before_checker(
     assert report["attempts"][1]["code"] == "duplicate_task_structure"
     assert checker_calls == 2
     assert len(tuple((tmp_path / "sampling/packs").iterdir())) == 2
+    assert prior_contexts == [(), ("objective-1",), ("objective-1",)]

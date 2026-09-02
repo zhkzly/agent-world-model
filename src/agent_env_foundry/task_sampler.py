@@ -65,6 +65,7 @@ def sample_good_tasks(
     attempts: list[JSONObject] = []
     accepted = 0
     accepted_structures: set[str] = set()
+    accepted_instructions: list[str] = []
     for index in range(1, candidate_budget + 1):
         attempt_root = root / "attempts" / f"attempt-{index:03d}"
         attempt_root.mkdir()
@@ -88,6 +89,7 @@ def sample_good_tasks(
                 builder_projection_digest=builder_projection_digest,
                 instance_directory=attempt_root / "proposal-instance",
                 route=selected_route,
+                prior_accepted_instructions=tuple(accepted_instructions),
                 client_factory=client_factory,
             )
             stage_elapsed[stage] = _elapsed_ms(stage_started)
@@ -211,6 +213,7 @@ def sample_good_tasks(
             )
             accepted += 1
             accepted_structures.add(structure_id)
+            accepted_instructions.append(proposed.candidate.instruction)
         except Exception as exc:
             stage_elapsed.setdefault(stage, _elapsed_ms(stage_started))
             kind, code, details = _attribution(exc)

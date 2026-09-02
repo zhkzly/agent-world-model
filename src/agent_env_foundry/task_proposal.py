@@ -56,6 +56,12 @@ Base the proposal only on the Development Brief, reset observation, ToolSpecs, a
 ToolObservations. Never assume hidden state. The public instruction must contain every
 load-bearing constraint, but must not reveal a solution path, hidden state, or answer key.
 
+The Host may supply previously accepted public instructions from this same Release. Propose a
+different semantic and execution objective. A change only in wording, selected entity or
+parameter, exploratory inspection order, or final-answer field labels is not a different Task.
+Reusing a public tool is fine when the required goal, condition, state transition, refusal
+outcome, or answer relation is materially different.
+
 After at least one real public tool call, return the required structured proposal. Encode the
 object-root Draft 2020-12 final-answer schema and your observed final answer as JSON strings.
 The checker brief is private input for a later independent code author: state the intended goal,
@@ -138,6 +144,7 @@ def propose_task_direct(
     instance_directory: Path,
     route: AgentRoute | None = None,
     reset_start: JSONObject | None = None,
+    prior_accepted_instructions: Sequence[str] = (),
     client_factory: ClientFactory | None = None,
 ) -> ProposedTask:
     """Explore one fresh public instance and return a proposal, never a verdict."""
@@ -153,6 +160,17 @@ def propose_task_direct(
             "CandidateRejected",
             "reset_start_invalid",
             "reset_start must be a JSON object or null",
+        )
+    prior_instructions = tuple(prior_accepted_instructions)
+    if (
+        isinstance(prior_accepted_instructions, (str, bytes))
+        or any(not isinstance(item, str) or not item.strip() for item in prior_instructions)
+        or len(prior_instructions) != len(set(prior_instructions))
+    ):
+        raise ProposalFailure(
+            "FrameworkDefect",
+            "prior_task_context_invalid",
+            "prior accepted instructions must be unique non-empty strings",
         )
     instance = _fresh_instance_path(instance_directory)
     selected_route = route or AgentRoute()
@@ -199,6 +217,7 @@ def propose_task_direct(
                         {
                             "development_brief": development_brief,
                             "reset_observation": reset_observation,
+                            "prior_accepted_instructions": list(prior_instructions),
                         },
                         ensure_ascii=False,
                         sort_keys=True,

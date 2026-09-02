@@ -242,8 +242,13 @@ def test_builder_uses_official_sdk_shape_and_same_thread_factual_repair(
     assert sdk.thread_kwargs["sandbox"].value == "full-access"
     assert sdk.thread is not None and len(sdk.thread.prompts) == 2
     assert "first factual failure" in sdk.thread.prompts[1]
+    assert "every listed failure" in sdk.thread.prompts[1]
     assert result.thread_id == "fake-thread"
     assert result.checks[-1].exit_code == 0
+
+
+def test_builder_default_allows_initial_generation_and_three_bounded_repairs() -> None:
+    assert BuilderConfig().max_turns == 4
 
 
 def test_semantic_acceptance_returns_all_findings_to_same_builder_thread(

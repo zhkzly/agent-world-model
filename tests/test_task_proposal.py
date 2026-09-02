@@ -159,6 +159,7 @@ def test_direct_proposal_uses_public_tools_and_host_captures_protected_evidence(
         development_brief={"need": "Maintain a persistent counter."},
         builder_projection_digest="2" * 64,
         instance_directory=tmp_path / "instance",
+        prior_accepted_instructions=("Increase a counter by one and report it.",),
         route=AgentRoute(),
         client_factory=lambda **kwargs: client,
     )
@@ -174,6 +175,8 @@ def test_direct_proposal_uses_public_tools_and_host_captures_protected_evidence(
     assert "before_state" not in first_input
     assert "after_state" not in first_input
     assert "checker_brief" not in first_input
+    assert "Increase a counter by one and report it." in first_input
+    assert "wording" in client.responses.calls[0]["instructions"]
     assert "challenge_categories" not in proposal_schema["properties"]
 
 

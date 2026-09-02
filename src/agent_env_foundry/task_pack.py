@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -68,7 +69,6 @@ def task_structure_id(
     candidate: CandidateTaskContract,
     evidence: TaskProposalEvidence,
 ) -> str:
-    tools: list[str] = []
     outcomes: list[JSONObject] = []
     for item in evidence.public_trace:
         tool = item.get("tool")
@@ -77,25 +77,53 @@ def task_structure_id(
             raise ValueError("proposal trace cannot define a Task structure")
         observation_document = cast(JSONObject, observation)
         error = observation_document.get("error")
-        tools.append(tool)
         outcomes.append(
             {
+                "tool": tool,
                 "ok": observation_document.get("ok"),
                 "error_code": error.get("code") if isinstance(error, dict) else None,
             }
         )
-    properties = candidate.final_answer_schema.get("properties")
     changes = json_leaf_changes(evidence.before_state, evidence.after_state)
-    projection: JSONObject = {
-        "tool_sequence": cast(JSONValue, tools),
-        "outcomes": cast(JSONValue, outcomes),
-        "state_change_paths": cast(JSONValue, sorted({str(item["path"]) for item in changes})),
-        "answer_fields": cast(
-            JSONValue, sorted(properties) if isinstance(properties, dict) else []
-        ),
-        "reset_start": candidate.reset_start,
-    }
+    change_paths = sorted({_path_shape(str(item["path"])) for item in changes})
+    failure_outcomes = _distinct_documents(item for item in outcomes if item["ok"] is False)
+    if change_paths:
+        projection: JSONObject = {
+            "format": "task-structure/2",
+            "state_change_paths": cast(JSONValue, change_paths),
+            "failure_outcomes": cast(JSONValue, failure_outcomes),
+            "reset_start": candidate.reset_start,
+        }
+    elif failure_outcomes:
+        projection = {
+            "format": "task-structure/2",
+            "refusal_outcomes": cast(JSONValue, failure_outcomes),
+            "reset_start": candidate.reset_start,
+        }
+    else:
+        properties = candidate.final_answer_schema.get("properties")
+        projection = {
+            "format": "task-structure/2",
+            "outcomes": cast(JSONValue, _distinct_documents(iter(outcomes))),
+            "answer_fields": cast(
+                JSONValue, sorted(properties) if isinstance(properties, dict) else []
+            ),
+            "reset_start": candidate.reset_start,
+        }
     return sha256_hex(canonical_bytes(projection))
+
+
+def _path_shape(path: str) -> str:
+    """Erase array positions while retaining the affected state relation."""
+
+    return "/".join("*" if segment.isdecimal() else segment for segment in path.split("/"))
+
+
+def _distinct_documents(values: Iterable[JSONObject]) -> list[JSONObject]:
+    distinct: dict[bytes, JSONObject] = {}
+    for value in values:
+        distinct.setdefault(canonical_bytes(value), value)
+    return [distinct[key] for key in sorted(distinct)]
 
 
 def verify_task_pack(root: Path, *, expected_id: str | None = None) -> VerifiedTaskPack:
