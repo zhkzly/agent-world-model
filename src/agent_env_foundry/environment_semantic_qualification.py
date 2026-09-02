@@ -17,7 +17,7 @@ from agent_env_foundry.environment import (
     ToolSpec,
     validate_tool_catalog,
 )
-from agent_env_foundry.jsonvalue import is_json_object
+from agent_env_foundry.jsonvalue import is_json_object, json_leaf_changes
 from agent_env_foundry.release import canonical_bytes, sha256_hex
 from agent_env_foundry.research import BuilderProjection
 
@@ -549,7 +549,7 @@ def _review_evidence_projection(evidence: tuple[JSONObject, ...]) -> JSONObject:
                 "before_digest": sha256_hex(canonical_bytes(before)),
                 "after_digest": sha256_hex(canonical_bytes(after)),
                 "state_changed": canonical_bytes(before) != canonical_bytes(after),
-                "state_changes": cast(JSONValue, _state_changes(before, after)),
+                "state_changes": cast(JSONValue, json_leaf_changes(before, after)),
             }
             if "state_after_reopen" in step:
                 reopened = step["state_after_reopen"]
@@ -571,7 +571,7 @@ def _review_evidence_projection(evidence: tuple[JSONObject, ...]) -> JSONObject:
                 "before_digest": sha256_hex(canonical_bytes(before)),
                 "after_digest": sha256_hex(canonical_bytes(after)),
                 "state_equal": canonical_bytes(before) == canonical_bytes(after),
-                "state_changes": cast(JSONValue, _state_changes(before, after)),
+                "state_changes": cast(JSONValue, json_leaf_changes(before, after)),
             }
             if item.get("operation") == "reset_after_actions":
                 lifecycle_projection["reset_observation"] = item.get("reset_observation")
@@ -597,75 +597,6 @@ def _review_evidence_projection(evidence: tuple[JSONObject, ...]) -> JSONObject:
         ],
         "scenarios": scenarios,
     }
-
-
-def _state_changes(before: JSONValue, after: JSONValue, path: str = "") -> list[JSONObject]:
-    if canonical_bytes(before) == canonical_bytes(after):
-        return []
-    if isinstance(before, dict) and isinstance(after, dict):
-        changes: list[JSONObject] = []
-        for key in sorted(set(before) | set(after)):
-            escaped = key.replace("~", "~0").replace("/", "~1")
-            child_path = f"{path}/{escaped}"
-            if key not in before:
-                changes.append(
-                    {
-                        "path": child_path,
-                        "before_present": False,
-                        "before": None,
-                        "after_present": True,
-                        "after": after[key],
-                    }
-                )
-            elif key not in after:
-                changes.append(
-                    {
-                        "path": child_path,
-                        "before_present": True,
-                        "before": before[key],
-                        "after_present": False,
-                        "after": None,
-                    }
-                )
-            else:
-                changes.extend(_state_changes(before[key], after[key], child_path))
-        return changes
-    if isinstance(before, list) and isinstance(after, list):
-        changes = []
-        for index in range(max(len(before), len(after))):
-            child_path = f"{path}/{index}"
-            if index >= len(before):
-                changes.append(
-                    {
-                        "path": child_path,
-                        "before_present": False,
-                        "before": None,
-                        "after_present": True,
-                        "after": after[index],
-                    }
-                )
-            elif index >= len(after):
-                changes.append(
-                    {
-                        "path": child_path,
-                        "before_present": True,
-                        "before": before[index],
-                        "after_present": False,
-                        "after": None,
-                    }
-                )
-            else:
-                changes.extend(_state_changes(before[index], after[index], child_path))
-        return changes
-    return [
-        {
-            "path": path or "/",
-            "before_present": True,
-            "before": before,
-            "after_present": True,
-            "after": after,
-        }
-    ]
 
 
 def _projection_from_document(document: Any) -> BuilderProjection:

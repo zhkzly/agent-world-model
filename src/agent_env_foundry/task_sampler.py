@@ -16,6 +16,7 @@ from agent_env_foundry.checker_author import (
     run_checker_author,
 )
 from agent_env_foundry.environment import JSONObject, JSONValue
+from agent_env_foundry.jsonvalue import is_json_object, json_leaf_changes
 from agent_env_foundry.physical_runtime import PreparationSettings
 from agent_env_foundry.project_identity import ProjectIdentityError, copy_authored_project
 from agent_env_foundry.public_agent import PublicAgentFailure, run_public_episode
@@ -42,15 +43,17 @@ def sample_good_tasks(
     builder_projection_digest: str,
     output_root: Path,
     candidate_budget: int,
-    target_count: int,
+    target_count: int | None,
     route: AgentRoute | None = None,
     checker_config: BuilderConfig | None = None,
     client_factory: Any = None,
 ) -> JSONObject:
     """Run one universal sampling loop; a failed candidate never changes its Release."""
 
-    if candidate_budget <= 0 or not 0 < target_count <= candidate_budget:
-        raise ValueError("candidate_budget must be positive and cover target_count")
+    if candidate_budget <= 0 or (
+        target_count is not None and not 0 < target_count <= candidate_budget
+    ):
+        raise ValueError("candidate_budget must be positive and cover optional target_count")
     root = _fresh_root(output_root)
     (root / "attempts").mkdir()
     (root / "packs").mkdir()
@@ -62,6 +65,7 @@ def sample_good_tasks(
     )
     attempts: list[JSONObject] = []
     accepted = 0
+    accepted_structures: set[str] = set()
     for index in range(1, candidate_budget + 1):
         attempt_root = root / "attempts" / f"attempt-{index:03d}"
         attempt_root.mkdir()
@@ -71,6 +75,7 @@ def sample_good_tasks(
         stage_elapsed: dict[str, int] = {}
         candidate_id: str | None = None
         task_id: str | None = None
+        structure_id: str | None = None
         proposal_provider_turns: int | None = None
         proposal_tool_calls: int | None = None
         proposal_usage: list[JSONObject | None] = []
@@ -93,6 +98,13 @@ def sample_good_tasks(
             candidate_id = proposed.candidate.candidate_id
             _write(attempt_root / "CandidateTaskContract.json", proposed.candidate.to_document())
             _write(attempt_root / "TaskProposalEvidence.json", proposed.evidence.to_document())
+
+            stage = "dedup"
+            stage_started = time.monotonic_ns()
+            structure_id = _task_structure_id(proposed.candidate, proposed.evidence)
+            if structure_id in accepted_structures:
+                raise _CandidateRejected("duplicate_task_structure")
+            stage_elapsed[stage] = _elapsed_ms(stage_started)
 
             stage = "checker"
             stage_started = time.monotonic_ns()
@@ -155,6 +167,7 @@ def sample_good_tasks(
                 "candidate": proposed.candidate.to_document(),
                 "proposal_evidence": proposed.evidence.to_document(),
                 "task": task.to_document(),
+                "structure_id": structure_id,
                 "witnesses": list(witnesses),
             }
             task_pack_id = sha256_hex(canonical_bytes(preimage))
@@ -178,6 +191,7 @@ def sample_good_tasks(
                     "candidate_id": candidate_id,
                     "task_id": task_id,
                     "task_pack_id": task_pack_id,
+                    "structure_id": structure_id,
                     "kind": None,
                     "code": None,
                     **_attempt_metrics(
@@ -193,6 +207,7 @@ def sample_good_tasks(
                 }
             )
             accepted += 1
+            accepted_structures.add(structure_id)
         except Exception as exc:
             stage_elapsed.setdefault(stage, _elapsed_ms(stage_started))
             kind, code, details = _attribution(exc)
@@ -204,6 +219,7 @@ def sample_good_tasks(
                     "candidate_id": candidate_id,
                     "task_id": task_id,
                     "task_pack_id": None,
+                    "structure_id": structure_id,
                     "kind": kind,
                     "code": code,
                     **_attempt_metrics(
@@ -231,7 +247,7 @@ def sample_good_tasks(
             )
         report = _report(prepared.identity.release_id, candidate_budget, target_count, attempts)
         _write(root / "DirectSamplingReport.json", report)
-        if accepted >= target_count:
+        if target_count is not None and accepted >= target_count:
             return report
     return _report(prepared.identity.release_id, candidate_budget, target_count, attempts)
 
@@ -373,7 +389,7 @@ def _attribution(exc: Exception) -> tuple[str, str, JSONObject]:
 def _report(
     release_id: str,
     candidate_budget: int,
-    target_count: int,
+    target_count: int | None,
     attempts: list[JSONObject],
 ) -> JSONObject:
     preimage: JSONObject = {
@@ -415,6 +431,36 @@ def _attempt_metrics(
 
 def _elapsed_ms(started: int) -> int:
     return max(0, (time.monotonic_ns() - started) // 1_000_000)
+
+
+def _task_structure_id(candidate: Any, evidence: Any) -> str:
+    tools: list[str] = []
+    outcomes: list[JSONObject] = []
+    for item in evidence.public_trace:
+        tool = item.get("tool")
+        observation = item.get("observation")
+        if not isinstance(tool, str) or not is_json_object(observation):
+            raise TaskSamplingError("proposal trace cannot define a Task structure")
+        error = observation.get("error")
+        tools.append(tool)
+        outcomes.append(
+            {
+                "ok": observation.get("ok"),
+                "error_code": error.get("code") if isinstance(error, dict) else None,
+            }
+        )
+    properties = candidate.final_answer_schema.get("properties")
+    changes = json_leaf_changes(evidence.before_state, evidence.after_state)
+    projection: JSONObject = {
+        "tool_sequence": cast(JSONValue, tools),
+        "outcomes": cast(JSONValue, outcomes),
+        "state_change_paths": cast(JSONValue, sorted({str(item["path"]) for item in changes})),
+        "answer_fields": cast(
+            JSONValue, sorted(properties) if isinstance(properties, dict) else []
+        ),
+        "reset_start": candidate.reset_start,
+    }
+    return sha256_hex(canonical_bytes(projection))
 
 
 def _fresh_root(path: Path) -> Path:

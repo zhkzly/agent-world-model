@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_env_foundry.jsonvalue import is_json_object, is_json_value
+from agent_env_foundry.jsonvalue import is_json_object, is_json_value, json_leaf_changes
 
 
 @pytest.mark.parametrize(
@@ -78,3 +78,30 @@ def test_is_json_object_accepts_only_str_keyed_dicts() -> None:
     assert not is_json_object(5)
     assert not is_json_object({1: "a"})
     assert not is_json_object({"a": object()})
+
+
+def test_json_leaf_changes_are_complete_ordered_and_presence_aware() -> None:
+    changes = json_leaf_changes(
+        {"count": 1, "items": [{"id": "a", "ready": False}], "removed": 3},
+        {
+            "count": 2,
+            "items": [{"id": "a", "ready": True}, {"id": "b"}],
+            "added": None,
+        },
+    )
+
+    assert [item["path"] for item in changes] == [
+        "/added",
+        "/count",
+        "/items/0/ready",
+        "/items/1",
+        "/removed",
+    ]
+    assert changes[0] == {
+        "path": "/added",
+        "before_present": False,
+        "before": None,
+        "after_present": True,
+        "after": None,
+    }
+    assert changes[-1]["after_present"] is False
