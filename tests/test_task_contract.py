@@ -8,9 +8,12 @@ from agent_env_foundry.task_contract import (
     CandidateTaskContract,
     TaskCheckResult,
     TaskProposalEvidence,
+    candidate_task_contract_from_document,
     make_task_check_request,
     seal_task_contract,
     task_check_result_from_document,
+    task_contract_from_document,
+    task_proposal_evidence_from_document,
 )
 
 
@@ -179,3 +182,18 @@ def test_checker_result_axes_are_the_only_pass_authority() -> None:
     document["score"] = 0.5
     with pytest.raises(ValueError, match="exactly"):
         task_check_result_from_document(document)
+
+
+def test_task_documents_round_trip_through_cold_exact_decoders() -> None:
+    evidence = _proposal_evidence()
+    candidate = _candidate()
+    task = seal_task_contract(candidate, checker_project_digest="a" * 64)
+
+    assert task_proposal_evidence_from_document(evidence.to_document()) == evidence
+    assert candidate_task_contract_from_document(candidate.to_document()) == candidate
+    assert task_contract_from_document(task.to_document()) == task
+
+    tampered = task.to_document()
+    tampered["legacy_field"] = True
+    with pytest.raises(ValueError, match="fields"):
+        task_contract_from_document(tampered)

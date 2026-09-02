@@ -327,6 +327,92 @@ def seal_task_contract(
     )
 
 
+def task_proposal_evidence_from_document(document: Any) -> TaskProposalEvidence:
+    value = _exact_document(
+        document,
+        {
+            "format",
+            "release_id",
+            "reset_start",
+            "reset_observation",
+            "before_state",
+            "after_state",
+            "public_trace",
+            "proposed_final_answer",
+        },
+        "TaskProposalEvidence",
+    )
+    trace = value["public_trace"]
+    if not isinstance(trace, list) or any(not is_json_object(item) for item in trace):
+        raise ValueError("TaskProposalEvidence public_trace must be an object array")
+    return TaskProposalEvidence(
+        cast(str, value["format"]),
+        cast(str, value["release_id"]),
+        cast(JSONObject | None, value["reset_start"]),
+        value["reset_observation"],
+        value["before_state"],
+        value["after_state"],
+        tuple(cast(list[JSONObject], trace)),
+        cast(JSONObject, value["proposed_final_answer"]),
+    )
+
+
+def candidate_task_contract_from_document(document: Any) -> CandidateTaskContract:
+    value = _exact_document(
+        document,
+        {
+            "format",
+            "release_id",
+            "builder_projection_digest",
+            "reset_start",
+            "instruction",
+            "final_answer_schema",
+            "checker_brief",
+            "proposal_evidence_digest",
+        },
+        "CandidateTaskContract",
+    )
+    return CandidateTaskContract(
+        cast(str, value["format"]),
+        cast(str, value["release_id"]),
+        cast(str, value["builder_projection_digest"]),
+        cast(JSONObject | None, value["reset_start"]),
+        cast(str, value["instruction"]),
+        cast(JSONObject, value["final_answer_schema"]),
+        cast(str, value["checker_brief"]),
+        cast(str, value["proposal_evidence_digest"]),
+    )
+
+
+def task_contract_from_document(document: Any) -> TaskContract:
+    value = _exact_document(
+        document,
+        {
+            "format",
+            "candidate_id",
+            "release_id",
+            "builder_projection_digest",
+            "reset_start",
+            "instruction",
+            "final_answer_schema",
+            "checker_project_digest",
+            "checker_factory",
+        },
+        "TaskContract",
+    )
+    return TaskContract(
+        cast(str, value["format"]),
+        cast(str, value["candidate_id"]),
+        cast(str, value["release_id"]),
+        cast(str, value["builder_projection_digest"]),
+        cast(JSONObject | None, value["reset_start"]),
+        cast(str, value["instruction"]),
+        cast(JSONObject, value["final_answer_schema"]),
+        cast(str, value["checker_project_digest"]),
+        cast(str, value["checker_factory"]),
+    )
+
+
 def make_task_check_request(
     task: TaskContract,
     *,
@@ -382,6 +468,13 @@ def _answer_schema(document: JSONObject) -> JSONObject:
     return schema
 
 
+def _exact_document(document: Any, keys: set[str], role: str) -> JSONObject:
+    if not is_json_object(document) or set(document) != keys:
+        actual = sorted(document) if isinstance(document, dict) else type(document).__name__
+        raise ValueError(f"{role} has invalid fields: expected {sorted(keys)}, got {actual}")
+    return cast(JSONObject, document)
+
+
 def _text(value: str, role: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{role} must be non-empty text")
@@ -419,7 +512,10 @@ __all__ = [
     "TaskCheckResult",
     "TaskContract",
     "TaskProposalEvidence",
+    "candidate_task_contract_from_document",
     "make_task_check_request",
     "seal_task_contract",
+    "task_contract_from_document",
     "task_check_result_from_document",
+    "task_proposal_evidence_from_document",
 ]

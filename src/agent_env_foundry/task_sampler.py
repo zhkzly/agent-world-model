@@ -16,12 +16,12 @@ from agent_env_foundry.checker_author import (
     run_checker_author,
 )
 from agent_env_foundry.environment import JSONObject, JSONValue
-from agent_env_foundry.jsonvalue import is_json_object, json_leaf_changes
 from agent_env_foundry.physical_runtime import PreparationSettings
 from agent_env_foundry.project_identity import ProjectIdentityError, copy_authored_project
 from agent_env_foundry.public_agent import PublicAgentFailure, run_public_episode
 from agent_env_foundry.release import canonical_bytes, sha256_hex
 from agent_env_foundry.task_contract import TaskContract, make_task_check_request
+from agent_env_foundry.task_pack import TASK_PACK_FORMAT, task_structure_id, verify_task_pack
 from agent_env_foundry.task_proposal import (
     PreparedTaskEnvironment,
     ProposalFailure,
@@ -29,7 +29,6 @@ from agent_env_foundry.task_proposal import (
 )
 
 SAMPLING_REPORT_FORMAT = "direct-task-sampling/1"
-TASK_PACK_FORMAT = "task-pack/1"
 
 
 class TaskSamplingError(RuntimeError):
@@ -101,7 +100,7 @@ def sample_good_tasks(
 
             stage = "dedup"
             stage_started = time.monotonic_ns()
-            structure_id = _task_structure_id(proposed.candidate, proposed.evidence)
+            structure_id = task_structure_id(proposed.candidate, proposed.evidence)
             if structure_id in accepted_structures:
                 raise _CandidateRejected("duplicate_task_structure")
             stage_elapsed[stage] = _elapsed_ms(stage_started)
@@ -182,6 +181,10 @@ def sample_good_tasks(
             if copied != task.checker_project_digest:
                 raise TaskSamplingError("copied checker identity changed")
             _write(pack_root / "TaskPack.json", pack_document)
+            try:
+                verify_task_pack(pack_root, expected_id=task_pack_id)
+            except ValueError as exc:
+                raise TaskSamplingError(f"cold TaskPack verification failed: {exc}") from exc
             stage_elapsed[stage] = _elapsed_ms(stage_started)
             attempts.append(
                 {
@@ -431,36 +434,6 @@ def _attempt_metrics(
 
 def _elapsed_ms(started: int) -> int:
     return max(0, (time.monotonic_ns() - started) // 1_000_000)
-
-
-def _task_structure_id(candidate: Any, evidence: Any) -> str:
-    tools: list[str] = []
-    outcomes: list[JSONObject] = []
-    for item in evidence.public_trace:
-        tool = item.get("tool")
-        observation = item.get("observation")
-        if not isinstance(tool, str) or not is_json_object(observation):
-            raise TaskSamplingError("proposal trace cannot define a Task structure")
-        error = observation.get("error")
-        tools.append(tool)
-        outcomes.append(
-            {
-                "ok": observation.get("ok"),
-                "error_code": error.get("code") if isinstance(error, dict) else None,
-            }
-        )
-    properties = candidate.final_answer_schema.get("properties")
-    changes = json_leaf_changes(evidence.before_state, evidence.after_state)
-    projection: JSONObject = {
-        "tool_sequence": cast(JSONValue, tools),
-        "outcomes": cast(JSONValue, outcomes),
-        "state_change_paths": cast(JSONValue, sorted({str(item["path"]) for item in changes})),
-        "answer_fields": cast(
-            JSONValue, sorted(properties) if isinstance(properties, dict) else []
-        ),
-        "reset_start": candidate.reset_start,
-    }
-    return sha256_hex(canonical_bytes(projection))
 
 
 def _fresh_root(path: Path) -> Path:

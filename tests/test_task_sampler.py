@@ -81,6 +81,10 @@ def test_sampler_rejects_one_candidate_then_continues_without_pressure_pipeline(
         "agent_env_foundry.task_sampler.copy_authored_project",
         lambda *args, **kwargs: "4" * 64,
     )
+    monkeypatch.setattr(
+        "agent_env_foundry.task_sampler.verify_task_pack",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
     prepared = SimpleNamespace(identity=SimpleNamespace(release_id="1" * 64))
 
     report = sample_good_tasks(
@@ -191,6 +195,10 @@ def test_sampler_without_target_exhausts_budget_and_deduplicates_before_checker(
     monkeypatch.setattr(
         "agent_env_foundry.task_sampler.copy_authored_project",
         lambda *args, **kwargs: "4" * 64,
+    )
+    monkeypatch.setattr(
+        "agent_env_foundry.task_sampler.verify_task_pack",
+        lambda *args, **kwargs: SimpleNamespace(),
     )
     prepared = SimpleNamespace(identity=SimpleNamespace(release_id="1" * 64))
 

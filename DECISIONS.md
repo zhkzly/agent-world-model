@@ -322,3 +322,5 @@ Builder self-verdict, Task, answer or reward enters S1 acceptance.
 `qualified-campaign-scheduling|介入0|返工0|serial warmup→same-id parallel resume+mutation licence|红线违反0`
 
 `s2-exhaustive-budget-sampling|介入0|返工0|15 attempts+no Task quota+pre-checker structural dedup+2 mutation licences|红线违反0`
+
+`s2-task-campaign-handoff|介入0|返工0|cold TaskPack+relocation+resumable records+CorpusManifest+2 mutation licences|红线违反0`
