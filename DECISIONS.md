@@ -306,3 +306,5 @@ Only EnvironmentRelease/3 and the Direct Task sampler remain as product
 authority. Shared canonical ZIP/hash/path helpers survive without a v2 reader,
 descriptor, publisher or compatibility switch; actor/checker are the only
 authored project roles.
+
+`s2-sampling-measurement|介入0|返工0|stage latency+turn/tool/token evidence+mutation licence|红线违反0`

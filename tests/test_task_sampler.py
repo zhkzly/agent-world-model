@@ -24,7 +24,12 @@ def test_sampler_rejects_one_candidate_then_continues_without_pressure_pipeline(
             raise ProposalFailure("CandidateRejected", "not_solved", "no executed solution")
         return SimpleNamespace(
             candidate=Document(candidate_id="2" * 64, document={"candidate": True}),
-            evidence=Document(document={"evidence": True}),
+            evidence=Document(
+                public_trace=({"tool": "inspect", "arguments": {}, "observation": {}},),
+                document={"evidence": True},
+            ),
+            provider_turns=2,
+            usage=({"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},),
         )
 
     task = Document(
@@ -59,6 +64,9 @@ def test_sampler_rejects_one_candidate_then_continues_without_pressure_pipeline(
             "format": "task-witness/1",
             "witness_index": witness_index,
             "witness_id": str(witness_index) * 64,
+            "provider_turns": 3,
+            "public_trace": [{"tool": "inspect"}, {"tool": "mutate"}],
+            "usage": [{"input_tokens": 20, "output_tokens": 10, "total_tokens": 30}],
         }
 
     monkeypatch.setattr("agent_env_foundry.task_sampler._fresh_solve", solve)
@@ -82,6 +90,19 @@ def test_sampler_rejects_one_candidate_then_continues_without_pressure_pipeline(
     assert report["rejected_count"] == 1
     assert report["attempts"][0]["code"] == "not_solved"
     assert report["attempts"][1]["task_pack_id"]
+    assert report["attempts"][1]["proposal_provider_turns"] == 2
+    assert report["attempts"][1]["proposal_tool_calls"] == 1
+    assert report["attempts"][1]["witness_provider_turns"] == [3, 3]
+    assert report["attempts"][1]["witness_tool_calls"] == [2, 2]
+    assert report["attempts"][1]["provider_usage"]["proposal"][0]["total_tokens"] == 15
+    assert set(report["attempts"][1]["stage_elapsed_ms"]) == {
+        "proposal",
+        "checker",
+        "checker_sanity",
+        "fresh_solve",
+        "package",
+    }
+    assert report["attempts"][1]["elapsed_ms"] >= 0
     assert sanity_calls == ["3" * 64]
     assert witness_indices == [1, 2]
     assert (tmp_path / "sampling/DirectSamplingReport.json").is_file()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -65,8 +66,17 @@ def sample_good_tasks(
         attempt_root = root / "attempts" / f"attempt-{index:03d}"
         attempt_root.mkdir()
         stage = "proposal"
+        attempt_started = time.monotonic_ns()
+        stage_started = attempt_started
+        stage_elapsed: dict[str, int] = {}
         candidate_id: str | None = None
         task_id: str | None = None
+        proposal_provider_turns: int | None = None
+        proposal_tool_calls: int | None = None
+        proposal_usage: list[JSONObject | None] = []
+        witness_provider_turns: list[int] = []
+        witness_tool_calls: list[int] = []
+        witness_usage: list[JSONValue] = []
         try:
             proposed = propose_task_direct(
                 prepared,
@@ -76,11 +86,16 @@ def sample_good_tasks(
                 route=selected_route,
                 client_factory=client_factory,
             )
+            stage_elapsed[stage] = _elapsed_ms(stage_started)
+            proposal_provider_turns = proposed.provider_turns
+            proposal_tool_calls = len(proposed.evidence.public_trace)
+            proposal_usage = list(proposed.usage)
             candidate_id = proposed.candidate.candidate_id
             _write(attempt_root / "CandidateTaskContract.json", proposed.candidate.to_document())
             _write(attempt_root / "TaskProposalEvidence.json", proposed.evidence.to_document())
 
             stage = "checker"
+            stage_started = time.monotonic_ns()
             workspace = prepare_checker_author_workspace(
                 attempt_root / "checker-project",
                 candidate=proposed.candidate,
@@ -90,8 +105,10 @@ def sample_good_tasks(
             task = checker.task_contract
             task_id = task.task_id
             _write(attempt_root / "TaskContract.json", task.to_document())
+            stage_elapsed[stage] = _elapsed_ms(stage_started)
 
             stage = "checker_sanity"
+            stage_started = time.monotonic_ns()
             _checker_sanity(
                 checker.root,
                 task=task,
@@ -99,8 +116,10 @@ def sample_good_tasks(
                 runtime_root=attempt_root / "checker-sanity-runtime",
                 settings=settings,
             )
+            stage_elapsed[stage] = _elapsed_ms(stage_started)
 
             stage = "fresh_solve"
+            stage_started = time.monotonic_ns()
             witnesses = tuple(
                 _fresh_solve(
                     prepared,
@@ -117,6 +136,12 @@ def sample_good_tasks(
                 )
                 for witness_index in (1, 2)
             )
+            stage_elapsed[stage] = _elapsed_ms(stage_started)
+            witness_provider_turns = [cast(int, item["provider_turns"]) for item in witnesses]
+            witness_tool_calls = [
+                len(cast(list[JSONValue], item["public_trace"])) for item in witnesses
+            ]
+            witness_usage = [item["usage"] for item in witnesses]
             for witness in witnesses:
                 _write(
                     attempt_root / f"TaskWitness-{witness['witness_index']}.json",
@@ -124,6 +149,7 @@ def sample_good_tasks(
                 )
 
             stage = "package"
+            stage_started = time.monotonic_ns()
             preimage: JSONObject = {
                 "format": TASK_PACK_FORMAT,
                 "candidate": proposed.candidate.to_document(),
@@ -143,6 +169,7 @@ def sample_good_tasks(
             if copied != task.checker_project_digest:
                 raise TaskSamplingError("copied checker identity changed")
             _write(pack_root / "TaskPack.json", pack_document)
+            stage_elapsed[stage] = _elapsed_ms(stage_started)
             attempts.append(
                 {
                     "attempt_index": index,
@@ -153,10 +180,21 @@ def sample_good_tasks(
                     "task_pack_id": task_pack_id,
                     "kind": None,
                     "code": None,
+                    **_attempt_metrics(
+                        attempt_started=attempt_started,
+                        stage_elapsed=stage_elapsed,
+                        proposal_provider_turns=proposal_provider_turns,
+                        proposal_tool_calls=proposal_tool_calls,
+                        proposal_usage=proposal_usage,
+                        witness_provider_turns=witness_provider_turns,
+                        witness_tool_calls=witness_tool_calls,
+                        witness_usage=witness_usage,
+                    ),
                 }
             )
             accepted += 1
         except Exception as exc:
+            stage_elapsed.setdefault(stage, _elapsed_ms(stage_started))
             kind, code, details = _attribution(exc)
             attempts.append(
                 {
@@ -168,6 +206,16 @@ def sample_good_tasks(
                     "task_pack_id": None,
                     "kind": kind,
                     "code": code,
+                    **_attempt_metrics(
+                        attempt_started=attempt_started,
+                        stage_elapsed=stage_elapsed,
+                        proposal_provider_turns=proposal_provider_turns,
+                        proposal_tool_calls=proposal_tool_calls,
+                        proposal_usage=proposal_usage,
+                        witness_provider_turns=witness_provider_turns,
+                        witness_tool_calls=witness_tool_calls,
+                        witness_usage=witness_usage,
+                    ),
                 }
             )
             _write(
@@ -338,6 +386,35 @@ def _report(
         "attempts": cast(JSONValue, attempts),
     }
     return {**preimage, "report_id": sha256_hex(canonical_bytes(preimage))}
+
+
+def _attempt_metrics(
+    *,
+    attempt_started: int,
+    stage_elapsed: dict[str, int],
+    proposal_provider_turns: int | None,
+    proposal_tool_calls: int | None,
+    proposal_usage: list[JSONObject | None],
+    witness_provider_turns: list[int],
+    witness_tool_calls: list[int],
+    witness_usage: list[JSONValue],
+) -> JSONObject:
+    return {
+        "elapsed_ms": _elapsed_ms(attempt_started),
+        "stage_elapsed_ms": cast(JSONObject, dict(stage_elapsed)),
+        "proposal_provider_turns": proposal_provider_turns,
+        "proposal_tool_calls": proposal_tool_calls,
+        "witness_provider_turns": cast(JSONValue, list(witness_provider_turns)),
+        "witness_tool_calls": cast(JSONValue, list(witness_tool_calls)),
+        "provider_usage": {
+            "proposal": cast(JSONValue, list(proposal_usage)),
+            "witnesses": cast(JSONValue, list(witness_usage)),
+        },
+    }
+
+
+def _elapsed_ms(started: int) -> int:
+    return max(0, (time.monotonic_ns() - started) // 1_000_000)
 
 
 def _fresh_root(path: Path) -> Path:
