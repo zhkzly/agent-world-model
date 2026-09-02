@@ -1,0 +1,10 @@
+{"file":"PROJECT.md","reason":"Reject any implementation that contradicts the newly approved S1/S2 authority or weakens semantic completion."}
+{"file":"DECISIONS.md","reason":"Audit clean-break deletion, no compatibility, no peer-reader truth and prior failed repair patterns."}
+{"file":".trellis/spec/backend/s1-coordinator.md","reason":"Check S1 publishes only executable environment truth and no Task/checker/reward authority."}
+{"file":".trellis/spec/backend/v2-preparation.md","reason":"Check the v3 replacement preserves physical isolation, cold materialization and public/protected separation."}
+{"file":".trellis/spec/backend/v2-qualification-publication.md","reason":"Prove old task-case Qualification is removed rather than renamed or hidden behind an adapter."}
+{"file":".trellis/spec/backend/s2-assessment-corpus.md","reason":"Check assessment/corpus policy remains identity-separated from Task truth."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/prd.md","reason":"Verify retained Good-Task gates, public solvability, replay and physical negatives."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/checklist.md","reason":"Reuse the strongest existing S2 leakage, checker and cold-artifact review questions where still applicable."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reject duplicate release readers, Agent loops, validators and compatibility helpers."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Audit release-to-TaskContract-to-checker-to-TaskPack lineage and protected data flow end to end."}
