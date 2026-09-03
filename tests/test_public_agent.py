@@ -127,6 +127,8 @@ def test_public_episode_preserves_exact_tool_loop_and_returns_trace(
     assert "Do not paraphrase" in PUBLIC_AGENT_SYSTEM_PROMPT
     assert "source every tool argument" in PUBLIC_AGENT_SYSTEM_PROMPT
     assert "inspect first" in PUBLIC_AGENT_SYSTEM_PROMPT
+    assert "Every final answer leaf" in PUBLIC_AGENT_SYSTEM_PROMPT
+    assert "Never invent" in PUBLIC_AGENT_SYSTEM_PROMPT
     continuation = responses.requests[1]["input"]
     assert continuation[1]["type"] == "function_call"
     assert continuation[2] == {

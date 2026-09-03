@@ -203,6 +203,8 @@ def test_sampling_agent_must_execute_then_emit_a_grounded_task_draft(tmp_path) -
     normalized_instructions = " ".join(request["instructions"].split())
     assert "quote every free string literal" in normalized_instructions
     assert "decorative free-text" in normalized_instructions
+    assert "smallest sufficient AnswerProjection" in normalized_instructions
+    assert "unrelated collections" in normalized_instructions
     assert "checker" not in str(request["text"]["format"]["schema"]).lower()
     assert "answer_schema" not in str(request["text"]["format"]["schema"])
     model_input = json.loads(request["input"][0]["content"])
@@ -402,6 +404,38 @@ def test_missing_answer_pointer_is_a_typed_draft_rejection(tmp_path) -> None:
     assert caught.value.kind == "DraftRejected"
     assert caught.value.code == "draft_answer_projection_invalid"
     assert "missing" in str(caught.value)
+
+
+def test_answer_projection_cannot_promote_transport_ok_to_task_answer(tmp_path) -> None:
+    terminal = _terminal()
+    terminal["answer_json"] = json.dumps(
+        {
+            "kind": "object",
+            "fields": {
+                "ok": {
+                    "kind": "source",
+                    "source": {
+                        "kind": "observation",
+                        "step": 1,
+                        "pointer": "/ok",
+                    },
+                }
+            },
+        }
+    )
+    client = Client([Response([_call()]), Response([], json.dumps(terminal))])
+
+    with pytest.raises(SamplingFailure) as caught:
+        sample_task_draft(
+            Prepared(),
+            development_brief={"need": "Maintain a persistent counter."},
+            target=_target(),
+            instance_directory=tmp_path / "instance",
+            route=AgentRoute(),
+            client_factory=lambda **kwargs: client,
+        )
+
+    assert caught.value.code == "draft_answer_transport_status_forbidden"
 
 
 def test_off_target_goal_shape_is_rejected_not_counted_as_sampling_success(tmp_path) -> None:

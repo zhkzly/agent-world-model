@@ -88,6 +88,12 @@ matches the final semantic token of its public JSON pointer: for example, source
 author an answer schema, Checker, reward,
 protected-state expectation, Python code, or admission verdict.
 
+Choose the smallest sufficient AnswerProjection that directly answers the instruction and
+proves the objective. Exclude transport ok, narrative restatements, unrelated collections,
+and duplicate flattened/nested views. Include status, history, or other post-state fields only
+when the instruction genuinely requires them and you actually inspected their values after the
+objective. A refusal normally needs its stable business error code, not a rewritten message.
+
 The user input contains task_draft_contract with the exact Goal and AnswerProjection syntax
 for this target. Follow those tagged JSON examples exactly; replace example steps, pointers,
 branches, fields, and literals only with values supported by your real public trace.
@@ -835,6 +841,12 @@ def _validate_sampled_draft(
                 actual_outcome=actual_outcome,
                 actual_tools=sorted(tools),
             )
+    if _answer_uses_transport_status(draft.answer):
+        raise SamplingFailure(
+            "DraftRejected",
+            "draft_answer_transport_status_forbidden",
+            "Task answers cannot promote ToolObservation transport ok into Task truth",
+        )
     if not set(target.required_focus_tools).issubset(tools):
         raise SamplingFailure(
             "DraftRejected",
@@ -876,6 +888,18 @@ def _answer_field_source_mismatch(
             if nested is not None:
                 return nested
     return None
+
+
+def _answer_uses_transport_status(projection: AnswerProjection) -> bool:
+    if projection.kind == "source":
+        source = cast(PublicValueRef, projection.source)
+        return source.kind == "observation" and source.pointer == "/ok"
+    children = (
+        (child for _, child in projection.fields)
+        if projection.kind == "object"
+        else iter(projection.items)
+    )
+    return any(_answer_uses_transport_status(child) for child in children)
 
 
 def _observed_outcome(objectives: list[TraceEvent], *, changed: bool) -> str:

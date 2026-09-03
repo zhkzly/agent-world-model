@@ -53,7 +53,10 @@ PUBLIC_AGENT_SYSTEM_PROMPT = (
     "case. Do not paraphrase, expand, or normalize task-owned literals in tool arguments. "
     "Before invoking, source every tool argument from an explicit instruction literal, reset, "
     "or a prior tool observation. If natural wording may refer to an environment-owned canonical "
-    "value, inspect first and copy the returned value instead of guessing it."
+    "value, inspect first and copy the returned value instead of guessing it. Every final answer "
+    "leaf must likewise be copied from an explicit instruction literal, reset, or a tool "
+    "observation. If a requested answer field has not been observed, inspect before answering. "
+    "Never invent status, history, messages, IDs, or success flags from an operation alone."
 )
 PUBLIC_AGENT_PROMPT_DIGEST = hashlib.sha256(PUBLIC_AGENT_SYSTEM_PROMPT.encode()).hexdigest()
 _OBSERVATION_GUIDANCE = (
