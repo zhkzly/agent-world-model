@@ -190,6 +190,19 @@ def write_episode_bundle(output_root: Path, record: EpisodeRecord) -> Path:
 def read_episode_bundle(output_root: Path, episode_id: str) -> TrainingEpisodeView:
     """Cold-verify a paired bundle and return only its derived public view."""
 
+    return _read_episode_pair(output_root, episode_id)[1]
+
+
+def read_episode_record(output_root: Path, episode_id: str) -> EpisodeRecord:
+    """Cold-verify a paired bundle and return its trusted Framework record."""
+
+    return _read_episode_pair(output_root, episode_id)[0]
+
+
+def _read_episode_pair(
+    output_root: Path, episode_id: str
+) -> tuple[EpisodeRecord, TrainingEpisodeView]:
+
     _digest(episode_id, "episode_id")
     root = _ordinary_directory(Path(output_root), "output_root")
     episodes = _ordinary_directory(root / "episodes", "episodes")
@@ -207,7 +220,7 @@ def read_episode_bundle(output_root: Path, episode_id: str) -> TrainingEpisodeVi
         raise ValueError("TrainingEpisodeView format is unsupported")
     if view_document != expected.to_document():
         raise ValueError("TrainingEpisodeView differs from its trusted projection")
-    return expected
+    return record, expected
 
 
 def _record_from_document(document: Any) -> EpisodeRecord:
@@ -215,8 +228,8 @@ def _record_from_document(document: Any) -> EpisodeRecord:
     if value["format"] != EPISODE_RECORD_FORMAT:
         raise ValueError("EpisodeRecord format is unsupported")
     record = EpisodeRecord(
-        _request_from_document(value["request"]),
-        _policy_from_document(value["policy"]),
+        episode_request_from_document(value["request"]),
+        policy_spec_from_document(value["policy"]),
         cast(str, value["materialization_id"]),
         _capture_from_document(value["capture"]),
         value["before_state"],
@@ -232,7 +245,7 @@ def _record_from_document(document: Any) -> EpisodeRecord:
     return record
 
 
-def _policy_from_document(document: Any) -> PolicySpec:
+def policy_spec_from_document(document: Any) -> PolicySpec:
     value = _exact(
         document,
         {
@@ -258,7 +271,7 @@ def _policy_from_document(document: Any) -> PolicySpec:
     )
 
 
-def _request_from_document(document: Any) -> EpisodeRequest:
+def episode_request_from_document(document: Any) -> EpisodeRequest:
     value = _exact(
         document,
         {"format", "release_id", "task_pack_id", "task_id", "policy_id", "rollout_index"},
@@ -483,7 +496,10 @@ __all__ = [
     "EPISODE_RECORD_FORMAT",
     "EpisodeRecord",
     "TRAINING_VIEW_FORMAT",
+    "episode_request_from_document",
+    "policy_spec_from_document",
     "read_episode_bundle",
+    "read_episode_record",
     "training_view",
     "write_episode_bundle",
 ]

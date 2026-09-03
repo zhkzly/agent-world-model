@@ -12,6 +12,7 @@ from agent_env_foundry.episodes import (
     PolicyCompletion,
     RewardOutcome,
 )
+from agent_env_foundry.preparation_v3 import OpenPreparedReleaseV3
 from agent_env_foundry.public_agent import PolicyDriver, capture_public_episode
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.task_admission import (
@@ -19,7 +20,6 @@ from agent_env_foundry.task_admission import (
     evaluation_trace_from_capture,
 )
 from agent_env_foundry.task_goal import EvaluationContext, EvaluationResult, evaluate_goal
-from agent_env_foundry.task_proposal import PreparedTaskEnvironment
 
 EpisodeExecutionOwner = Literal["infrastructure", "environment", "task_artifact", "evidence"]
 
@@ -33,7 +33,7 @@ class EpisodeExecutionFailure(RuntimeError):
 
 
 def run_task_episode(
-    prepared: PreparedTaskEnvironment,
+    prepared: OpenPreparedReleaseV3,
     task_pack: TaskPackArtifact,
     request: EpisodeRequest,
     *,
@@ -135,7 +135,7 @@ def run_task_episode(
 
 
 def _validate_authority(
-    prepared: PreparedTaskEnvironment,
+    prepared: OpenPreparedReleaseV3,
     task_pack: TaskPackArtifact,
     request: EpisodeRequest,
     policy_driver: PolicyDriver,
