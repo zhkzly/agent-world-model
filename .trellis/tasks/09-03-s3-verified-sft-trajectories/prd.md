@@ -12,7 +12,7 @@ data:
 -> complete public action/observation/final-answer trajectories
 -> post-reopen common Goal evaluation
 -> reward 1.0 / 0.0 / null
--> EpisodeRecord/2 + TrainingEpisodeView/2 + EpisodeBatchManifest/2
+-> EpisodeRecord/3 + TrainingEpisodeView/2 + EpisodeBatchManifest/2
 ```
 
 The product outcome is verified trajectory data, not an interface-only demo.
@@ -90,7 +90,8 @@ not secretly replaced by retry-until-success.
 
 ### R6. Trusted and training projections
 
-`EpisodeRecord/2` binds request, policy, complete public capture, protected
+`EpisodeRecord/3` binds request, policy, complete public capture including typed
+provider/runtime failure details, protected
 before/post-reopen state, common evaluation and reward. Its derived
 `TrainingEpisodeView/2` contains only the public input, ordered observable
 interaction, completion and reward plus exact source IDs. It excludes

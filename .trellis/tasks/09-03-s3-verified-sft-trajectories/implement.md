@@ -2,7 +2,7 @@
 
 ## Checkpoint A — Freeze current contracts
 
-- Add RED tests for `EpisodeRecord/2`, `TrainingEpisodeView/2` and
+- Add RED tests for `EpisodeRecord/3`, `TrainingEpisodeView/2` and
   `EpisodeBatchManifest/2` identities and exact key sets.
 - Remove the stale Checker owner/format from current Episode leaf contracts.
 - Add strict current-only readers; old checker-bound `/1` artifacts fail.

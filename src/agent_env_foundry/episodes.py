@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 from agent_env_foundry.environment import (
@@ -287,6 +287,7 @@ class PublicEpisodeCapture:
     turns: tuple[PolicyTurn, ...]
     completion: PolicyCompletion | None
     defect: EpisodeDefect | None
+    details: JSONObject = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_input, PublicEpisodeInput):
@@ -304,6 +305,7 @@ class PublicEpisodeCapture:
             raise ValueError("defect must be an EpisodeDefect")
         if self.completion is None and self.defect is None:
             raise ValueError("capture requires a completion or defect")
+        object.__setattr__(self, "details", _normal_object(self.details, "capture details"))
 
     def to_document(self) -> JSONObject:
         return {
@@ -311,6 +313,7 @@ class PublicEpisodeCapture:
             "turns": [item.to_document() for item in self.turns],
             "completion": self.completion.to_document() if self.completion is not None else None,
             "defect": self.defect.to_document() if self.defect is not None else None,
+            "details": _copy_object(self.details),
         }
 
 

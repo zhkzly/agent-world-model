@@ -405,6 +405,10 @@ def test_responses_request_defects_keep_prefix_and_have_exact_owner(
     assert capture.defect is not None and capture.defect.owner == owner
     assert capture.defect.code == "responses_request_failed"
     assert capture.completion is None
+    details = capture.to_document()["details"]
+    assert details["original_code"] == type(failure).__name__
+    if isinstance(failure, StatusFailure):
+        assert details["status_code"] == failure.status_code
     assert capture.turns[0].calls[0].observation == VALID_OBSERVATION
     assert actor.calls == [("inspect_item", {"item": "public-1"})]
 

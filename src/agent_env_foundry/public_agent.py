@@ -465,7 +465,7 @@ def _capture(
     if unattributed is not None:
         raise unattributed
     return (
-        PublicEpisodeCapture(public_input, tuple(turns), completion, defect),
+        PublicEpisodeCapture(public_input, tuple(turns), completion, defect, details),
         details,
     )
 

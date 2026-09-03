@@ -25,7 +25,7 @@ from agent_env_foundry.jsonvalue import is_json_object, is_json_value
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.task_goal import EvaluationResult
 
-EPISODE_RECORD_FORMAT = "episode-record/2"
+EPISODE_RECORD_FORMAT = "episode-record/3"
 TRAINING_VIEW_FORMAT = "training-episode-view/2"
 
 _RECORD_KEYS = {
@@ -289,13 +289,18 @@ def episode_request_from_document(document: Any) -> EpisodeRequest:
 
 
 def _capture_from_document(document: Any) -> PublicEpisodeCapture:
-    value = _exact(document, {"public_input", "turns", "completion", "defect"}, "capture")
+    value = _exact(
+        document,
+        {"public_input", "turns", "completion", "defect", "details"},
+        "capture",
+    )
     turns = _array(value["turns"], "capture turns")
     return PublicEpisodeCapture(
         _public_input_from_document(value["public_input"]),
         tuple(_turn_from_document(item) for item in turns),
         None if value["completion"] is None else _completion_from_document(value["completion"]),
         None if value["defect"] is None else _defect_from_document(value["defect"]),
+        cast(JSONObject, value["details"]),
     )
 
 

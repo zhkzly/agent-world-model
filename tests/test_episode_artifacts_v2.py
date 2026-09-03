@@ -161,7 +161,7 @@ def test_episode_record_and_training_view_are_current_and_non_leaking() -> None:
     record = _record()
     view = training_view(record)
 
-    assert record.to_document()["format"] == "episode-record/2"
+    assert record.to_document()["format"] == "episode-record/3"
     assert view.to_document()["format"] == "training-episode-view/2"
     assert record.episode_id == hashlib.sha256(canonical_bytes(record.preimage())).hexdigest()
     assert view.episode_id == record.episode_id
@@ -229,7 +229,7 @@ def test_episode_bundle_rejects_old_format_and_independently_mutated_view(tmp_pa
     record_path = path / "EpisodeRecord.json"
 
     old = json.loads(record_path.read_text())
-    old["format"] = "episode-record/1"
+    old["format"] = "episode-record/2"
     record_path.write_bytes(canonical_bytes(old))
     with pytest.raises(ValueError, match="unsupported"):
         read_episode_bundle(store, record.episode_id)

@@ -58,7 +58,7 @@ EpisodeRequest(
 `rollout_index` is 1 through 8 for each TaskPack. Parallel scheduling cannot
 change the request ID.
 
-### 3.2 EpisodeRecord/2
+### 3.2 EpisodeRecord/3
 
 One trusted record contains:
 
