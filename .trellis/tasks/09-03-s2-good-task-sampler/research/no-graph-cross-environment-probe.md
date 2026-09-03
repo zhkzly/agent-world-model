@@ -206,6 +206,23 @@ repeated terminal error. It also rejects ToolObservation `/ok` as an If
 business condition. The next support attempt emitted the correct business
 scalar in one terminal turn.
 
+Checkpoint C1 then ran the new Host materializer and fresh replay:
+
+- support If produced Candidate
+  `b800bf22622465b3ee9eb3e189e531656ef081715ab52f9f6da12c053e44f7f5`;
+  its condition was public `overdue == true`, all seven argument leaves were
+  sourced from reset IDs, and all six evaluator obligations passed;
+- inventory ForEach produced Candidate
+  `123dec12330e3cc39c69801347da5d623e2fb9e36de6b4b385b289262deb0e00`;
+  replay step mutations were
+  `[false,false,true,true,false,false]`, so exactly the two member release
+  objectives mutated state while discovery/verification calls remained
+  non-authoritative.
+
+One independent support attempt was correctly rejected before replay because
+its DraftGoal omitted the required focus tool. Sampling rejection did not
+trigger an environment, prompt or evaluator repair.
+
 ## Decision
 
 - Execution-first generic Agent sampling is physically plausible across

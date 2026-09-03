@@ -371,3 +371,10 @@ The Sampling Agent receives business-only BuilderProjection fields plus the
 exact target-specific DraftGoal and AnswerProjection forms. Rejected terminal,
 exact error and valid form travel together; repeated encoding failure stops
 instead of accumulating opaque continuation history.
+
+`s2-candidate-replay-c1|介入1|返工0|public provenance+per-step state+fresh replay+common evaluation+support/inventory live+5 mutation licences|红线违反0`
+
+Host re-resolves every reference-solution argument from Task/reset/prior
+ToolObservation values and snapshots state after each replayed call. A mutation
+outside DraftGoal is rejected before Candidate creation; infrastructure,
+environment and draft failures retain separate owners.

@@ -309,6 +309,19 @@ class EvaluationResult:
     checked: tuple[str, ...]
     reason_codes: tuple[str, ...]
 
+    def to_document(self) -> JSONObject:
+        return {
+            "passed": self.passed,
+            "reset": self.reset,
+            "before_state": self.before_state,
+            "after_state": self.after_state,
+            "answer_schema": self.answer_schema,
+            "answer": self.answer,
+            "goal": self.goal,
+            "checked": list(self.checked),
+            "reason_codes": list(self.reason_codes),
+        }
+
 
 def evaluate_goal(truth: GoalTruth, context: EvaluationContext) -> EvaluationResult:
     if not isinstance(truth, GoalTruth) or not isinstance(context, EvaluationContext):
