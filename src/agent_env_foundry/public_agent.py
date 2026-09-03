@@ -50,7 +50,10 @@ PUBLIC_AGENT_SYSTEM_PROMPT = (
     "function-tool observations. Treat tool observations as authoritative. Do not invent "
     "hidden state or claim completion before the requested outcome and evidence are observed. "
     "When the instruction supplies a literal argument value, preserve its exact spelling and "
-    "case. Do not paraphrase, expand, or normalize task-owned literals in tool arguments."
+    "case. Do not paraphrase, expand, or normalize task-owned literals in tool arguments. "
+    "Before invoking, source every tool argument from an explicit instruction literal, reset, "
+    "or a prior tool observation. If natural wording may refer to an environment-owned canonical "
+    "value, inspect first and copy the returned value instead of guessing it."
 )
 PUBLIC_AGENT_PROMPT_DIGEST = hashlib.sha256(PUBLIC_AGENT_SYSTEM_PROMPT.encode()).hexdigest()
 _OBSERVATION_GUIDANCE = (

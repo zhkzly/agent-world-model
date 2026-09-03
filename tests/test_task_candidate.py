@@ -12,6 +12,7 @@ from agent_env_foundry.environment import success_observation
 from agent_env_foundry.task_candidate import (
     CandidateMaterializationFailure,
     candidate_task_from_document,
+    derive_argument_origins,
     materialize_candidate,
 )
 from agent_env_foundry.task_draft import (
@@ -239,6 +240,67 @@ def test_hidden_argument_not_in_task_reset_or_prior_observation_is_rejected(tmp_
         )
 
     assert caught.value.code == "argument_source_unresolved"
+
+
+def test_free_string_argument_must_be_explicitly_quoted_in_the_task(tmp_path) -> None:
+    target = SamplingTarget("atom", ("increment",), "transition")
+    trace = (
+        TraceEvent(
+            1,
+            "increment",
+            {"counter_id": "other counter", "amount": 2},
+            success_observation({"counter_id": "other counter", "count": 2}),
+        ),
+    )
+    draft = TaskDraft(
+        target.target_id,
+        "Increase the other counter by exactly 2 and report its result.",
+        AtomDraft(1),
+        AnswerProjection.from_object(
+            {"result": AnswerProjection.from_source(PublicValueRef.observation(1, "/data"))}
+        ),
+    )
+    evidence = TaskSamplingEvidence(
+        "1" * 64,
+        target.target_id,
+        None,
+        {"counter_id": "counter-main", "count": 0},
+        {"counters": [{"id": "counter-main", "count": 0}]},
+        {"counters": [{"id": "counter-main", "count": 2}]},
+        trace,
+        {"result": {"counter_id": "other counter", "count": 2}},
+        ANSWER_SCHEMA,
+    )
+
+    with pytest.raises(CandidateMaterializationFailure) as caught:
+        materialize_candidate(
+            Prepared(),
+            sampled=SampledTaskDraft(draft, evidence, 2, (None, None)),
+            target=target,
+            builder_projection_digest="2" * 64,
+            replay_instance=tmp_path / "replay",
+        )
+
+    assert caught.value.code == "argument_literal_not_explicit"
+
+
+def test_machine_delimited_string_literal_does_not_require_extra_quotes() -> None:
+    trace = (
+        TraceEvent(
+            1,
+            "increment",
+            {"counter_id": "counter-2", "amount": 2},
+            success_observation({"counter_id": "counter-2", "count": 2}),
+        ),
+    )
+
+    origins = derive_argument_origins(
+        trace,
+        reset={},
+        instruction="Increase counter-2 by exactly 2.",
+    )
+
+    assert origins[0].source == PublicValueRef.task_literal("counter-2")
 
 
 def test_unexplained_sampling_mutation_is_not_folded_into_goal(tmp_path) -> None:
