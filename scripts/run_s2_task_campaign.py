@@ -73,20 +73,37 @@ def _campaign_config(
     source_commit: str,
     seed: int,
     attempt_budget: int,
+    minimum_packs: int,
+    recovery_budget: int,
 ) -> JSONObject:
-    if attempt_budget <= 0 or seed < 0:
-        raise ValueError("seed and attempt budget must be non-negative/positive")
+    if attempt_budget <= 0 or minimum_packs <= 0 or recovery_budget < 0 or seed < 0:
+        raise ValueError("campaign budgets and minimum coverage are invalid")
     return {
         "format": "s2-good-task-campaign-config/1",
         "s1_campaign_id": s1_campaign_id,
         "source_commit": source_commit,
         "seed": seed,
         "attempt_budget_per_release": attempt_budget,
+        "minimum_packs_per_release": minimum_packs,
+        "recovery_attempt_budget": recovery_budget,
         "model": "gpt-5.6-luna",
         "base_url": "http://127.0.0.1:8317/v1",
         "filter_runs": 5,
         "minimum_passes": 2,
     }
+
+
+def _needs_more_attempts(
+    attempt_count: int,
+    admitted_count: int,
+    *,
+    base_budget: int,
+    minimum_packs: int,
+    recovery_budget: int,
+) -> bool:
+    if attempt_count < base_budget:
+        return True
+    return admitted_count < minimum_packs and attempt_count < base_budget + recovery_budget
 
 
 def _select_target(
@@ -581,6 +598,8 @@ def _release_record(
     campaign_id: str,
     source: JSONObject,
     attempts: list[JSONObject],
+    base_attempt_budget: int,
+    minimum_packs: int,
 ) -> JSONObject:
     terminal_counts = Counter(str(item["terminal"]) for item in attempts)
     admitted = [item for item in attempts if item["terminal"] == "admitted"]
@@ -611,6 +630,9 @@ def _release_record(
             "finished_at": max(cast(str, item["finished_at"]) for item in attempts),
             "public_tool_count": len(cast(list[JSONValue], source["tool_names"])),
             "attempt_count": len(attempts),
+            "base_attempt_count": min(len(attempts), base_attempt_budget),
+            "recovery_attempt_count": max(0, len(attempts) - base_attempt_budget),
+            "task_covered": len(admitted) >= minimum_packs,
             "attempt_terminal_counts": dict(sorted(terminal_counts.items())),
             "sampled_count": len(sampled),
             "candidate_count": len(candidates),
@@ -676,6 +698,8 @@ def _run_release(
     campaign_root: Path,
     campaign_id: str,
     attempt_budget: int,
+    minimum_packs: int,
+    recovery_budget: int,
     seed: int,
     route: AgentRoute,
 ) -> JSONObject:
@@ -687,8 +711,21 @@ def _run_release(
         release_id=cast(str, source["release_id"]),
     )
     record_path = campaign_root / "records" / f"{need_id}.json"
-    if len(attempts) >= attempt_budget:
-        record = _release_record(campaign_id=campaign_id, source=source, attempts=attempts)
+    admitted_count = sum(item["terminal"] == "admitted" for item in attempts)
+    if not _needs_more_attempts(
+        len(attempts),
+        admitted_count,
+        base_budget=attempt_budget,
+        minimum_packs=minimum_packs,
+        recovery_budget=recovery_budget,
+    ):
+        record = _release_record(
+            campaign_id=campaign_id,
+            source=source,
+            attempts=attempts,
+            base_attempt_budget=attempt_budget,
+            minimum_packs=minimum_packs,
+        )
         _atomic_write(record_path, record)
         return record
     prepared = prepare_release_v3_internal(
@@ -697,7 +734,13 @@ def _run_release(
     probe = _unused_path(need_root / f"catalog-probe-{len(attempts) + 1:03d}")
     with prepared.open(probe) as session:
         tool_names = tuple(item["name"] for item in session.actor.tools())
-    while len(attempts) < attempt_budget:
+    while _needs_more_attempts(
+        len(attempts),
+        admitted_count,
+        base_budget=attempt_budget,
+        minimum_packs=minimum_packs,
+        recovery_budget=recovery_budget,
+    ):
         attempt_index = len(attempts) + 1
         prior = [cast(dict[str, object], item) for item in attempts]
         target = _select_target(
@@ -712,20 +755,26 @@ def _run_release(
             for item in attempts
             if item.get("terminal") == "admitted" and isinstance(item.get("public_summary"), dict)
         )
-        attempts.append(
-            _run_attempt(
-                prepared,
-                campaign_root=campaign_root,
-                need_root=need_root,
-                need_id=need_id,
-                campaign_id=campaign_id,
-                attempt_index=attempt_index,
-                target=target,
-                prior_summaries=summaries,
-                route=route,
-            )
+        attempt_record = _run_attempt(
+            prepared,
+            campaign_root=campaign_root,
+            need_root=need_root,
+            need_id=need_id,
+            campaign_id=campaign_id,
+            attempt_index=attempt_index,
+            target=target,
+            prior_summaries=summaries,
+            route=route,
         )
-    record = _release_record(campaign_id=campaign_id, source=source, attempts=attempts)
+        attempts.append(attempt_record)
+        admitted_count += attempt_record["terminal"] == "admitted"
+    record = _release_record(
+        campaign_id=campaign_id,
+        source=source,
+        attempts=attempts,
+        base_attempt_budget=attempt_budget,
+        minimum_packs=minimum_packs,
+    )
     _atomic_write(record_path, record)
     _print(
         {
@@ -816,6 +865,20 @@ def _campaign_summary(
             "environment_count": len(records),
             "release_terminal_coverage": _value_counts(records, "terminal"),
             "attempt_count": sum(int(item["attempt_count"]) for item in records),
+            "base_attempt_count": sum(
+                int(item.get("base_attempt_count", item["attempt_count"])) for item in records
+            ),
+            "recovery_attempt_count": sum(
+                int(item.get("recovery_attempt_count", 0)) for item in records
+            ),
+            "environment_task_coverage": {
+                "covered": sum(
+                    bool(item.get("task_covered", item["admitted_count"])) for item in records
+                ),
+                "uncovered": sum(
+                    not bool(item.get("task_covered", item["admitted_count"])) for item in records
+                ),
+            },
             "attempt_terminal_counts": _merge_counts(records, "attempt_terminal_counts"),
             "sampled_count": sum(int(item["sampled_count"]) for item in records),
             "candidate_count": sum(int(item["candidate_count"]) for item in records),
@@ -940,11 +1003,18 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--attempt-budget", type=int, default=15)
+    parser.add_argument("--minimum-packs-per-release", type=int, default=1)
+    parser.add_argument("--recovery-attempt-budget", type=int, default=15)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--sample-releases", type=int)
     args = parser.parse_args()
-    if args.workers <= 0 or (args.sample_releases is not None and args.sample_releases <= 0):
-        parser.error("workers and sample-releases must be positive")
+    if (
+        args.workers <= 0
+        or args.minimum_packs_per_release <= 0
+        or args.recovery_attempt_budget < 0
+        or (args.sample_releases is not None and args.sample_releases <= 0)
+    ):
+        parser.error("workers/coverage must be positive and recovery non-negative")
     repo = Path(__file__).resolve().parents[1]
     if _git(repo, "status", "--porcelain"):
         raise RuntimeError("campaign source worktree must be clean and committed")
@@ -959,6 +1029,8 @@ def main() -> int:
         source_commit=_git(repo, "rev-parse", "HEAD"),
         seed=args.seed,
         attempt_budget=args.attempt_budget,
+        minimum_packs=args.minimum_packs_per_release,
+        recovery_budget=args.recovery_attempt_budget,
     )
     campaign_id = _digest(config)
     campaign_root = args.output_root.resolve() / campaign_id
@@ -989,6 +1061,8 @@ def main() -> int:
                 campaign_root=campaign_root,
                 campaign_id=campaign_id,
                 attempt_budget=args.attempt_budget,
+                minimum_packs=args.minimum_packs_per_release,
+                recovery_budget=args.recovery_attempt_budget,
                 seed=args.seed,
                 route=route,
             ): cast(str, source["need_id"])

@@ -261,11 +261,30 @@ def test_campaign_identity_excludes_worker_scheduling() -> None:
         source_commit="b" * 40,
         seed=17,
         attempt_budget=15,
+        minimum_packs=1,
+        recovery_budget=15,
     )
 
     assert config["attempt_budget_per_release"] == 15
+    assert config["minimum_packs_per_release"] == 1
+    assert config["recovery_attempt_budget"] == 15
     assert config["model"] == "gpt-5.6-luna"
     assert "workers" not in config
+
+
+def test_bounded_recovery_runs_only_after_base_budget_for_uncovered_release() -> None:
+    module = _campaign_module()
+
+    assert module._needs_more_attempts(14, 0, base_budget=15, minimum_packs=1, recovery_budget=15)
+    assert module._needs_more_attempts(14, 1, base_budget=15, minimum_packs=1, recovery_budget=15)
+    assert module._needs_more_attempts(15, 0, base_budget=15, minimum_packs=1, recovery_budget=15)
+    assert module._needs_more_attempts(29, 0, base_budget=15, minimum_packs=1, recovery_budget=15)
+    assert not module._needs_more_attempts(
+        30, 0, base_budget=15, minimum_packs=1, recovery_budget=15
+    )
+    assert not module._needs_more_attempts(
+        15, 1, base_budget=15, minimum_packs=1, recovery_budget=15
+    )
 
 
 def test_canary_release_selection_is_seeded_and_not_input_order_dependent() -> None:
