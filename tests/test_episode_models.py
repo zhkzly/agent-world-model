@@ -370,7 +370,6 @@ def test_defect_owner_set_is_closed_and_provider_is_not_infrastructure() -> None
         "infrastructure",
         "environment",
         "task_artifact",
-        "checker",
         "evidence",
     }
 
@@ -380,6 +379,8 @@ def test_defect_owner_set_is_closed_and_provider_is_not_infrastructure() -> None
     }
     assert set(defects) == owners
     assert defects["provider"].owner != defects["infrastructure"].owner
+    with pytest.raises(ValueError, match="owner"):
+        EpisodeDefect("checker", "legacy_checker_failed", "capture")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="owner"):
         EpisodeDefect("policy", "bad_answer", "capture")  # type: ignore[arg-type]
 

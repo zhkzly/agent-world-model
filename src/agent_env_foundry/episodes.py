@@ -23,7 +23,6 @@ type DefectOwner = Literal[
     "infrastructure",
     "environment",
     "task_artifact",
-    "checker",
     "evidence",
 ]
 type _CompletionKind = Literal["completed", "policy_failure"]
@@ -35,7 +34,6 @@ _DEFECT_OWNERS = frozenset(
         "infrastructure",
         "environment",
         "task_artifact",
-        "checker",
         "evidence",
     }
 )
@@ -404,7 +402,7 @@ class TrainingEpisodeView:
 
     def to_document(self) -> JSONObject:
         return {
-            "format": "training-episode-view/1",
+            "format": "training-episode-view/2",
             "episode_id": self.episode_id,
             "request_id": self.request_id,
             "request": self.request.to_document(),

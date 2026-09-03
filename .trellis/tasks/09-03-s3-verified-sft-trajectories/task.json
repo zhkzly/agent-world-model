@@ -3,7 +3,7 @@
   "name": "s3-verified-sft-trajectories",
   "title": "S3 Verified SFT Trajectories",
   "description": "Collect 552 fresh Luna Episodes from the exact 69-TaskPack corpus and publish verified tokenizer-neutral SFT trajectories.",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": "Current multi-release TaskPack-to-Episode runtime and 552-rollout Luna campaign",
   "package": null,
