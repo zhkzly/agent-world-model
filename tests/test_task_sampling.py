@@ -425,6 +425,26 @@ def test_transition_target_requires_a_real_protected_state_change(tmp_path) -> N
 
     assert caught.value.kind == "DraftRejected"
     assert caught.value.code == "draft_transition_noop"
+    assert caught.value.details["actual_outcome"] == "query"
+
+
+def test_outcome_mismatch_precedes_focus_redirect_and_retains_actual_tool(tmp_path) -> None:
+    client = Client([Response([_call()]), Response([], json.dumps(_terminal()))])
+    target = SamplingTarget("atom", ("inspect",), "refusal")
+
+    with pytest.raises(SamplingFailure) as caught:
+        sample_task_draft(
+            Prepared(),
+            development_brief={"need": "Maintain a persistent counter."},
+            target=target,
+            instance_directory=tmp_path / "instance",
+            route=AgentRoute(),
+            client_factory=lambda **kwargs: client,
+        )
+
+    assert caught.value.code == "draft_nontransition_changed_state"
+    assert caught.value.details["actual_outcome"] == "transition"
+    assert caught.value.details["actual_tools"] == ["increment"]
 
 
 def test_agent_can_return_typed_unsupported_after_public_inspection(tmp_path) -> None:

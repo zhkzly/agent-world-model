@@ -404,6 +404,7 @@ def sample_task_draft(
     try:
         _validate_sampled_draft(draft, target, trace, before_state, after_state)
     except SamplingFailure as exc:
+        exc.details.setdefault("rejected_draft", draft.to_document())
         _retain_sampling_metrics(exc, provider_turns, usage, public_trace)
         raise
     try:
@@ -420,6 +421,7 @@ def sample_task_draft(
             "draft_answer_projection_invalid",
             str(exc),
         )
+        failure.details.setdefault("rejected_draft", draft.to_document())
         _retain_sampling_metrics(failure, provider_turns, usage, public_trace)
         raise failure from exc
     evidence = TaskSamplingEvidence(
@@ -793,24 +795,23 @@ def _validate_sampled_draft(
         )
     objectives = [events[step] for step in steps]
     tools = {event.tool_name for event in objectives}
-    if not set(target.required_focus_tools).issubset(tools):
-        raise SamplingFailure(
-            "DraftRejected",
-            "draft_focus_tool_missing",
-            "required focus tools must participate in the objective",
-            required=list(target.required_focus_tools),
-            actual=sorted(tools),
-        )
     changed = canonical_bytes(before_state) != canonical_bytes(after_state)
+    actual_outcome = _observed_outcome(objectives, changed=changed)
     if target.required_outcome == "transition" and not changed:
         raise SamplingFailure(
-            "DraftRejected", "draft_transition_noop", "transition target made no state change"
+            "DraftRejected",
+            "draft_transition_noop",
+            "transition target made no state change",
+            actual_outcome=actual_outcome,
+            actual_tools=sorted(tools),
         )
     if target.required_outcome != "transition" and changed:
         raise SamplingFailure(
             "DraftRejected",
             "draft_nontransition_changed_state",
             "query/refusal target changed protected state",
+            actual_outcome=actual_outcome,
+            actual_tools=sorted(tools),
         )
     for event in objectives:
         ok = event.observation["ok"]
@@ -826,7 +827,18 @@ def _validate_sampled_draft(
                 "draft_objective_outcome_mismatch",
                 "objective observation does not satisfy the required outcome",
                 step=event.seq,
+                actual_outcome=actual_outcome,
+                actual_tools=sorted(tools),
             )
+    if not set(target.required_focus_tools).issubset(tools):
+        raise SamplingFailure(
+            "DraftRejected",
+            "draft_focus_tool_missing",
+            "required focus tools must participate in the objective",
+            required=list(target.required_focus_tools),
+            actual=sorted(tools),
+            actual_outcome=actual_outcome,
+        )
     mismatch = _answer_field_source_mismatch(draft.answer)
     if mismatch is not None:
         field, pointer = mismatch
@@ -859,6 +871,15 @@ def _answer_field_source_mismatch(
             if nested is not None:
                 return nested
     return None
+
+
+def _observed_outcome(objectives: list[TraceEvent], *, changed: bool) -> str:
+    successes = [event.observation["ok"] is True for event in objectives]
+    if successes and not any(successes):
+        return "refusal"
+    if all(successes):
+        return "transition" if changed else "query"
+    return "mixed"
 
 
 def _semantic_pointer_leaf(pointer: str | None) -> str | None:
@@ -967,6 +988,7 @@ def _retain_sampling_metrics(
         "usage", [_object_copy(item) if item is not None else None for item in usage]
     )
     failure.details.setdefault("public_tool_calls", len(public_trace))
+    failure.details.setdefault("public_trace", [_object_copy(item) for item in public_trace])
 
 
 def _json_copy(value: JSONValue) -> JSONValue:

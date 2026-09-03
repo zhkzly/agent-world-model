@@ -114,6 +114,15 @@ def _select_target(
         value = record.get("structure_id")
         if isinstance(value, str):
             structure_ids.add(value)
+    redirect = _redirect_target(prior_records, tool_names)
+    if redirect is not None:
+        shape, outcome, tool = redirect
+        return SamplingTarget(
+            cast(Any, shape),
+            (tool,),
+            cast(Any, outcome),
+            tuple(sorted(structure_ids)),
+        )
     shape = _underused(
         _SHAPES,
         shape_counts,
@@ -144,6 +153,43 @@ def _select_target(
         cast(Any, outcome),
         tuple(sorted(structure_ids)),
     )
+
+
+def _redirect_target(
+    prior_records: list[dict[str, object]], tool_names: tuple[str, ...]
+) -> tuple[str, str, str] | None:
+    if not prior_records:
+        return None
+    latest = prior_records[-1]
+    if latest.get("terminal") != "DraftRejected":
+        return None
+    target = latest.get("target")
+    details = latest.get("details")
+    if not isinstance(target, dict) or not isinstance(details, dict):
+        return None
+    shape = target.get("required_goal_shape")
+    required_outcome = target.get("required_outcome")
+    code = latest.get("code")
+    actual_tools = details.get("actual")
+    outcome = required_outcome
+    if code != "draft_focus_tool_missing":
+        actual_tools = details.get("actual_tools")
+        outcome = details.get("actual_outcome")
+    if shape not in _SHAPES or outcome not in _OUTCOMES or not isinstance(actual_tools, list):
+        return None
+    prior_cells = {
+        (
+            str(cast(dict[str, Any], record["target"])["required_goal_shape"]),
+            str(cast(dict[str, Any], record["target"])["required_outcome"]),
+            str(cast(list[Any], cast(dict[str, Any], record["target"])["required_focus_tools"])[0]),
+        )
+        for record in prior_records
+    }
+    for tool in sorted(value for value in actual_tools if isinstance(value, str)):
+        cell = (str(shape), str(outcome), tool)
+        if tool in tool_names and cell not in prior_cells:
+            return cell
+    return None
 
 
 def _underused(
@@ -486,12 +532,15 @@ def _run_attempt(
                     "output_tokens": failure_output,
                 }
             )
+        retained_details = _safe_details(exc.details)
+        if isinstance(retained_details, dict):
+            retained_details.setdefault("message", str(exc))
         base.update(
             {
                 "terminal": exc.kind,
                 "owner": exc.kind,
                 "code": exc.code,
-                "details": _safe_details(exc.details),
+                "details": retained_details,
             }
         )
     except Exception as exc:

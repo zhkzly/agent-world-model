@@ -84,6 +84,37 @@ def test_scheduler_is_resume_deterministic_and_carries_prior_structure_ids() -> 
     assert first.prior_structure_ids == ("b" * 64,)
 
 
+def test_scheduler_redirects_one_rejected_off_focus_execution_without_a_graph() -> None:
+    module = _campaign_module()
+    prior = [
+        {
+            "target": {
+                "format": "sampling-target/1",
+                "required_goal_shape": "if",
+                "required_focus_tools": ["list_reservations"],
+                "required_outcome": "transition",
+                "prior_structure_ids": [],
+            },
+            "terminal": "DraftRejected",
+            "code": "draft_focus_tool_missing",
+            "details": {"actual": ["reserve_equipment"]},
+            "structure_id": None,
+        }
+    ]
+
+    target = module._select_target(
+        release_id="a" * 64,
+        tool_names=("list_reservations", "reserve_equipment", "return_loan"),
+        seed=17,
+        attempt_index=2,
+        prior_records=prior,
+    )
+
+    assert target.required_goal_shape == "if"
+    assert target.required_outcome == "transition"
+    assert target.required_focus_tools == ("reserve_equipment",)
+
+
 def test_corpus_fan_in_is_order_independent_and_deduplicates_structure() -> None:
     module = _campaign_module()
     members = [
