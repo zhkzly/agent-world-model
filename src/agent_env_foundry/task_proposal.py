@@ -70,6 +70,11 @@ ID, version, quantity, message, or target affecting truth must be uniquely selec
 evidence or written exactly in the instruction. Do not expose tool names, a solution path,
 hidden state, or answer values in the instruction.
 
+For task-owned text that is not copied from reset or an observation, quote every free string
+literal in the instruction and state that its spelling and case are exact. Avoid decorative
+free-text arguments, especially in refusal Tasks: every literal must be part of the user intent
+and reproducible by a fresh Agent. Do not rely on a solver paraphrasing back to the sampled bytes.
+
 For an If target, the condition must be the public business scalar that the instruction
 actually depends on and must occur before the branch objective. Never use ToolObservation
 /ok, generic request success, tool availability, or the whole data collection as the condition.

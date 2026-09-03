@@ -48,7 +48,9 @@ type _DriverTerminal = Literal["none", "final_answer", "refusal"]
 PUBLIC_AGENT_SYSTEM_PROMPT = (
     "Complete only the public task using the instruction, reset observation, and public "
     "function-tool observations. Treat tool observations as authoritative. Do not invent "
-    "hidden state or claim completion before the requested outcome and evidence are observed."
+    "hidden state or claim completion before the requested outcome and evidence are observed. "
+    "When the instruction supplies a literal argument value, preserve its exact spelling and "
+    "case. Do not paraphrase, expand, or normalize task-owned literals in tool arguments."
 )
 PUBLIC_AGENT_PROMPT_DIGEST = hashlib.sha256(PUBLIC_AGENT_SYSTEM_PROMPT.encode()).hexdigest()
 _OBSERVATION_GUIDANCE = (

@@ -297,6 +297,12 @@ def materialize_candidate(
             {event.seq: event for event in replay_trace},
             dict(zip((event.seq for event in replay_trace), mutations, strict=True)),
         )
+        if _if_branch_repeats_condition_query(goal):
+            raise CandidateMaterializationFailure(
+                "DraftRejected",
+                "if_branch_repeats_condition_query",
+                "an If condition query cannot also be its only branch objective",
+            )
         truth = GoalTruth(
             goal,
             evidence.reset_observation,
@@ -490,6 +496,30 @@ def _goal_source(source: PublicValueRef, events: dict[int, TraceEvent]) -> GoalV
         raise ValueError("Goal condition/member source cannot be a Task literal")
     event = events[cast(int, source.step)]
     return GoalValueSource.observation(event.tool_name, event.arguments, cast(str, source.pointer))
+
+
+def _if_branch_repeats_condition_query(goal: Goal) -> bool:
+    if isinstance(goal, AtomGoal):
+        return False
+    if isinstance(goal, AllGoal):
+        return any(_if_branch_repeats_condition_query(child) for child in goal.children)
+    if isinstance(goal, ForEachGoal):
+        return False
+    source = goal.condition.source
+    repeated = any(
+        isinstance(branch, AtomGoal)
+        and branch.outcome == "query"
+        and source.kind == "observation"
+        and branch.tool_name == source.tool_name
+        and _same(branch.arguments, cast(JSONObject, source.arguments))
+        for branch in (goal.then_goal, goal.else_goal)
+        if branch is not None
+    )
+    return repeated or any(
+        _if_branch_repeats_condition_query(branch)
+        for branch in (goal.then_goal, goal.else_goal)
+        if branch is not None
+    )
 
 
 def _structure_id(truth: GoalTruth) -> str:

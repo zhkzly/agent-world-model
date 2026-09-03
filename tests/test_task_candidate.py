@@ -17,6 +17,7 @@ from agent_env_foundry.task_candidate import (
 from agent_env_foundry.task_draft import (
     AnswerProjection,
     AtomDraft,
+    IfDraft,
     PublicValueRef,
     SamplingTarget,
     TaskDraft,
@@ -309,3 +310,64 @@ def test_replay_infrastructure_failure_keeps_its_owner(tmp_path) -> None:
 
     assert caught.value.kind == "InfrastructureFailure"
     assert caught.value.code == "reference_replay_failed"
+
+
+def test_if_condition_query_cannot_be_its_only_branch_objective(tmp_path) -> None:
+    target = SamplingTarget("if", ("inspect",), "query")
+    trace = (
+        TraceEvent(
+            1,
+            "inspect",
+            {"counter_id": "counter-main"},
+            success_observation({"counter_id": "counter-main", "count": 0}),
+        ),
+        TraceEvent(
+            2,
+            "inspect",
+            {"counter_id": "counter-main"},
+            success_observation({"counter_id": "counter-main", "count": 0}),
+        ),
+    )
+    draft = TaskDraft(
+        target.target_id,
+        "Inspect counter-main. If its count is zero, retrieve and report the same counter.",
+        IfDraft(
+            PublicValueRef.observation(1, "/data/count"),
+            "eq",
+            0,
+            AtomDraft(2),
+            None,
+        ),
+        AnswerProjection.from_object(
+            {"count": AnswerProjection.from_source(PublicValueRef.observation(2, "/data/count"))}
+        ),
+    )
+    evidence = TaskSamplingEvidence(
+        "1" * 64,
+        target.target_id,
+        None,
+        {"counter_id": "counter-main", "count": 0},
+        {"counters": [{"id": "counter-main", "count": 0}]},
+        {"counters": [{"id": "counter-main", "count": 0}]},
+        trace,
+        {"count": 0},
+        {
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+            "additionalProperties": False,
+        },
+    )
+    sampled = SampledTaskDraft(draft, evidence, 3, (None, None, None))
+
+    with pytest.raises(CandidateMaterializationFailure) as caught:
+        materialize_candidate(
+            Prepared(),
+            sampled=sampled,
+            target=target,
+            builder_projection_digest="2" * 64,
+            replay_instance=tmp_path / "replay",
+        )
+
+    assert caught.value.kind == "DraftRejected"
+    assert caught.value.code == "if_branch_repeats_condition_query"

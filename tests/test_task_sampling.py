@@ -200,6 +200,9 @@ def test_sampling_agent_must_execute_then_emit_a_grounded_task_draft(tmp_path) -
     request = client.calls[0]
     assert request["tool_choice"] == "required"
     assert "SamplingTarget is mandatory" in request["instructions"]
+    normalized_instructions = " ".join(request["instructions"].split())
+    assert "quote every free string literal" in normalized_instructions
+    assert "decorative free-text" in normalized_instructions
     assert "checker" not in str(request["text"]["format"]["schema"]).lower()
     assert "answer_schema" not in str(request["text"]["format"]["schema"])
     model_input = json.loads(request["input"][0]["content"])

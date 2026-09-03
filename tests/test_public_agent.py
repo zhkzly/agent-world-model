@@ -123,6 +123,8 @@ def test_public_episode_preserves_exact_tool_loop_and_returns_trace(
     assert "error.code" in responses.requests[0]["tools"][0]["description"]
     assert "when needed" not in PUBLIC_AGENT_SYSTEM_PROMPT
     assert "final JSON" not in PUBLIC_AGENT_SYSTEM_PROMPT
+    assert "exact spelling and case" in PUBLIC_AGENT_SYSTEM_PROMPT
+    assert "Do not paraphrase" in PUBLIC_AGENT_SYSTEM_PROMPT
     continuation = responses.requests[1]["input"]
     assert continuation[1]["type"] == "function_call"
     assert continuation[2] == {
