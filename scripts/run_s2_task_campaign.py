@@ -284,6 +284,25 @@ def _safe_details(value: Any) -> JSONValue:
         return {"unserializable_details": str(value)}
 
 
+def _select_pending_sources(
+    sources: list[JSONObject],
+    *,
+    existing: dict[str, JSONObject],
+    seed: int,
+    sample_releases: int | None,
+) -> list[JSONObject]:
+    pending = [source for source in sources if source["need_id"] not in existing]
+    pending.sort(key=lambda source: cast(str, source["need_id"]))
+    if sample_releases is None:
+        return pending
+    return sorted(
+        pending,
+        key=lambda source: hashlib.sha256(
+            f"{seed}\0{source['need_id']}\0{source['release_id']}".encode()
+        ).hexdigest(),
+    )[:sample_releases]
+
+
 def _usage_totals(values: Any) -> tuple[int, int]:
     input_tokens = output_tokens = 0
     if isinstance(values, dict):
@@ -455,6 +474,18 @@ def _run_attempt(
                     }
                 )
     except (SamplingFailure, CandidateMaterializationFailure, TaskAdmissionFailure) as exc:
+        if isinstance(exc, SamplingFailure):
+            turns = exc.details.get("provider_turns")
+            calls = exc.details.get("public_tool_calls")
+            failure_input, failure_output = _usage_totals(exc.details.get("usage"))
+            base.update(
+                {
+                    "sampling_provider_turns": turns if isinstance(turns, int) else 0,
+                    "sampling_tool_calls": calls if isinstance(calls, int) else 0,
+                    "input_tokens": failure_input,
+                    "output_tokens": failure_output,
+                }
+            )
         base.update(
             {
                 "terminal": exc.kind,
@@ -818,10 +849,10 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--attempt-budget", type=int, default=15)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--max-new-releases", type=int)
+    parser.add_argument("--sample-releases", type=int)
     args = parser.parse_args()
-    if args.workers <= 0 or (args.max_new_releases is not None and args.max_new_releases <= 0):
-        parser.error("workers and max-new-releases must be positive")
+    if args.workers <= 0 or (args.sample_releases is not None and args.sample_releases <= 0):
+        parser.error("workers and sample-releases must be positive")
     repo = Path(__file__).resolve().parents[1]
     if _git(repo, "status", "--porcelain"):
         raise RuntimeError("campaign source worktree must be clean and committed")
@@ -851,9 +882,12 @@ def main() -> int:
     }
     if any(record.get("campaign_id") != campaign_id for record in existing.values()):
         raise ValueError("campaign release record identity drift")
-    pending = [source for source in sources if source["need_id"] not in existing]
-    if args.max_new_releases is not None:
-        pending = pending[: args.max_new_releases]
+    pending = _select_pending_sources(
+        sources,
+        existing=existing,
+        seed=args.seed,
+        sample_releases=args.sample_releases,
+    )
     route = AgentRoute()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {

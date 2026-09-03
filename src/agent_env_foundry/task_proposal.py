@@ -374,18 +374,23 @@ def sample_task_draft(
             after_state = prepared.read_state(instance)
         except Exception as exc:
             raise _environment_failure("sampling_state_read_failed", exc) from exc
+    except SamplingFailure as exc:
+        _retain_sampling_metrics(exc, provider_turns, usage, public_trace)
+        raise
     finally:
         close = getattr(client, "close", None)
         if callable(close):
             close()
 
     if terminal.status == "unsupported":
-        raise SamplingFailure(
+        failure = SamplingFailure(
             "SamplingUnsupported",
             "sampling_target_unsupported",
             cast(str, terminal.reason),
             sampling_target_id=target.target_id,
         )
+        _retain_sampling_metrics(failure, provider_turns, usage, public_trace)
+        raise failure
     draft = cast(TaskDraft, terminal.draft)
     trace = tuple(
         TraceEvent(
@@ -396,7 +401,11 @@ def sample_task_draft(
         )
         for index, item in enumerate(public_trace, 1)
     )
-    _validate_sampled_draft(draft, target, trace, before_state, after_state)
+    try:
+        _validate_sampled_draft(draft, target, trace, before_state, after_state)
+    except SamplingFailure as exc:
+        _retain_sampling_metrics(exc, provider_turns, usage, public_trace)
+        raise
     try:
         answer = materialize_answer(
             draft.answer,
@@ -406,11 +415,13 @@ def sample_task_draft(
             tool_specs=tuple(catalog.values()),
         )
     except ValueError as exc:
-        raise SamplingFailure(
+        failure = SamplingFailure(
             "DraftRejected",
             "draft_answer_projection_invalid",
             str(exc),
-        ) from exc
+        )
+        _retain_sampling_metrics(failure, provider_turns, usage, public_trace)
+        raise failure from exc
     evidence = TaskSamplingEvidence(
         prepared.identity.release_id,
         target.target_id,
@@ -943,6 +954,19 @@ def _provider_failure_kind(exc: Exception) -> SamplingFailureKind:
         if getattr(exc, "status_code", None) in {400, 422}
         else "InfrastructureFailure"
     )
+
+
+def _retain_sampling_metrics(
+    failure: SamplingFailure,
+    provider_turns: int,
+    usage: list[JSONObject | None],
+    public_trace: list[JSONObject],
+) -> None:
+    failure.details.setdefault("provider_turns", provider_turns)
+    failure.details.setdefault(
+        "usage", [_object_copy(item) if item is not None else None for item in usage]
+    )
+    failure.details.setdefault("public_tool_calls", len(public_trace))
 
 
 def _json_copy(value: JSONValue) -> JSONValue:

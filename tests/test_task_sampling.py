@@ -382,6 +382,12 @@ def test_off_target_goal_shape_is_rejected_not_counted_as_sampling_success(tmp_p
 
     assert caught.value.kind == "DraftRejected"
     assert caught.value.code == "draft_goal_shape_mismatch"
+    assert caught.value.details["provider_turns"] == 2
+    assert caught.value.details["public_tool_calls"] == 1
+    assert caught.value.details["usage"] == [
+        {"input_tokens": 10, "output_tokens": 5},
+        {"input_tokens": 10, "output_tokens": 5},
+    ]
 
 
 def test_required_focus_tool_must_be_an_objective_not_exploration(tmp_path) -> None:

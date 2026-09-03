@@ -218,3 +218,27 @@ def test_campaign_identity_excludes_worker_scheduling() -> None:
     assert config["attempt_budget_per_release"] == 15
     assert config["model"] == "gpt-5.6-luna"
     assert "workers" not in config
+
+
+def test_canary_release_selection_is_seeded_and_not_input_order_dependent() -> None:
+    module = _campaign_module()
+    sources = [
+        {"need_id": f"need-{index:02d}", "release_id": str(index) * 64} for index in range(1, 11)
+    ]
+
+    first = module._select_pending_sources(
+        sources,
+        existing={},
+        seed=17,
+        sample_releases=4,
+    )
+    second = module._select_pending_sources(
+        list(reversed(sources)),
+        existing={},
+        seed=17,
+        sample_releases=4,
+    )
+
+    assert [item["need_id"] for item in first] == [item["need_id"] for item in second]
+    assert len(first) == 4
+    assert [item["need_id"] for item in first] != [f"need-{index:02d}" for index in range(1, 5)]
