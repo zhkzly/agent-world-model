@@ -175,6 +175,9 @@ def test_campaign_summary_keeps_sampling_filter_and_infrastructure_counts_separa
             "input_tokens": 100,
             "output_tokens": 20,
             "elapsed_ms": 400,
+            "started_at": "2026-09-03T00:00:00Z",
+            "finished_at": "2026-09-03T00:00:00.400000Z",
+            "public_tool_count": 2,
             "goal_attempts": {"atom": 1, "all": 1, "if": 1},
             "goal_admitted": {"atom": 1},
             "outcome_attempts": {"query": 1, "transition": 1, "refusal": 1},
@@ -202,6 +205,9 @@ def test_campaign_summary_keeps_sampling_filter_and_infrastructure_counts_separa
             "input_tokens": 80,
             "output_tokens": 15,
             "elapsed_ms": 600,
+            "started_at": "2026-09-03T00:00:00.100000Z",
+            "finished_at": "2026-09-03T00:00:00.700000Z",
+            "public_tool_count": 1,
             "goal_attempts": {"foreach": 2},
             "goal_admitted": {},
             "outcome_attempts": {"transition": 2},
@@ -229,9 +235,20 @@ def test_campaign_summary_keeps_sampling_filter_and_infrastructure_counts_separa
     }
     assert summary["sampled_count"] == 3
     assert summary["candidate_count"] == 3
+    assert summary["reference_replay_count"] == 3
     assert summary["admitted_task_count"] == 1
+    assert summary["public_tool_coverage"]["available"] == 3
     assert summary["public_tool_calls"] == {"sampling": 9, "filter": 17, "total": 26}
     assert summary["tokens"] == {"input": 180, "output": 35, "total": 215}
+    assert summary["elapsed_ms"]["wall_clock"] == 700
+    assert summary["cost_per_admitted_task"] == {
+        "input_tokens": 180,
+        "output_tokens": 35,
+        "total_tokens": 215,
+        "public_tool_calls": 26,
+        "provider_turns": 25,
+        "cumulative_elapsed_ms": 1000,
+    }
     assert summary["checker_generation"] == {"provider_turns": 0, "tokens": 0}
     assert summary["summary_id"]
 

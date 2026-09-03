@@ -11,6 +11,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean, median
 from typing import Any, cast
@@ -46,6 +47,10 @@ def _print(document: JSONObject) -> None:
 
 def _digest(document: Any) -> str:
     return hashlib.sha256(canonical_bytes(document)).hexdigest()
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _atomic_write(path: Path, document: JSONObject) -> None:
@@ -280,6 +285,7 @@ def _read_s1_releases(campaign_root: Path) -> list[JSONObject]:
                 "domain": document["domain"],
                 "release_id": release_id,
                 "release_path": str(release_path),
+                "tool_names": cast(JSONValue, list(document["tool_names"])),
             }
         )
     if len(campaign_ids) != 1:
@@ -389,6 +395,7 @@ def _run_attempt(
         "need_id": need_id,
         "release_id": prepared.identity.release_id,
         "attempt_index": attempt_index,
+        "started_at": _utc_now(),
         "target": target.to_document(),
         "target_id": target.target_id,
         "terminal": "FrameworkDefect",
@@ -553,6 +560,7 @@ def _run_attempt(
             }
         )
     base["elapsed_ms"] = (time.monotonic_ns() - started) // 1_000_000
+    base["finished_at"] = _utc_now()
     base["record_id"] = _digest(base)
     _atomic_write(attempt / "terminal.json", base)
     _print(
@@ -599,6 +607,9 @@ def _release_record(
             "domain": source["domain"],
             "release_id": source["release_id"],
             "terminal": "completed",
+            "started_at": min(cast(str, item["started_at"]) for item in attempts),
+            "finished_at": max(cast(str, item["finished_at"]) for item in attempts),
+            "public_tool_count": len(cast(list[JSONValue], source["tool_names"])),
             "attempt_count": len(attempts),
             "attempt_terminal_counts": dict(sorted(terminal_counts.items())),
             "sampled_count": len(sampled),
@@ -782,6 +793,16 @@ def _campaign_summary(
     output_tokens = sum(int(item["output_tokens"]) for item in records)
     sampling_calls = sum(int(item["sampling_tool_calls"]) for item in records)
     filter_calls = sum(int(item["filter_tool_calls"]) for item in records)
+    sampling_turns = sum(int(item["sampling_provider_turns"]) for item in records)
+    filter_turns = sum(int(item["filter_provider_turns"]) for item in records)
+    admitted_count = sum(int(item["admitted_count"]) for item in records)
+    wall_clock_ms = round(
+        (
+            max(_parse_time(str(item["finished_at"])) for item in records)
+            - min(_parse_time(str(item["started_at"])) for item in records)
+        ).total_seconds()
+        * 1000
+    )
     task_pack_ids = sorted(
         task_pack_id for item in records for task_pack_id in cast(list[str], item["task_pack_ids"])
     )
@@ -798,13 +819,15 @@ def _campaign_summary(
             "attempt_terminal_counts": _merge_counts(records, "attempt_terminal_counts"),
             "sampled_count": sum(int(item["sampled_count"]) for item in records),
             "candidate_count": sum(int(item["candidate_count"]) for item in records),
-            "admitted_task_count": sum(int(item["admitted_count"]) for item in records),
+            "reference_replay_count": sum(int(item["candidate_count"]) for item in records),
+            "admitted_task_count": admitted_count,
             "unique_structure_count": sum(int(item["unique_structure_count"]) for item in records),
             "goal_attempts": _merge_counts(records, "goal_attempts"),
             "goal_admitted": _merge_counts(records, "goal_admitted"),
             "outcome_attempts": _merge_counts(records, "outcome_attempts"),
             "outcome_admitted": _merge_counts(records, "outcome_admitted"),
             "public_tool_coverage": {
+                "available": sum(int(item["public_tool_count"]) for item in records),
                 "attempted": len(
                     {
                         (item["release_id"], tool)
@@ -832,8 +855,8 @@ def _campaign_summary(
                 "total": sampling_calls + filter_calls,
             },
             "provider_turns": {
-                "sampling": sum(int(item["sampling_provider_turns"]) for item in records),
-                "filter": sum(int(item["filter_provider_turns"]) for item in records),
+                "sampling": sampling_turns,
+                "filter": filter_turns,
             },
             "tokens": {
                 "input": input_tokens,
@@ -842,15 +865,35 @@ def _campaign_summary(
             },
             "checker_generation": {"provider_turns": 0, "tokens": 0},
             "elapsed_ms": {
+                "wall_clock": wall_clock_ms,
                 "total": sum(elapsed),
                 "mean": round(mean(elapsed)) if elapsed else None,
                 "p50": round(median(elapsed)) if elapsed else None,
                 "p95": _percentile(elapsed, 0.95),
             },
+            "cost_per_admitted_task": (
+                {
+                    "input_tokens": round(input_tokens / admitted_count),
+                    "output_tokens": round(output_tokens / admitted_count),
+                    "total_tokens": round((input_tokens + output_tokens) / admitted_count),
+                    "public_tool_calls": round((sampling_calls + filter_calls) / admitted_count),
+                    "provider_turns": round((sampling_turns + filter_turns) / admitted_count),
+                    "cumulative_elapsed_ms": round(sum(elapsed) / admitted_count),
+                }
+                if admitted_count
+                else None
+            ),
             "task_pack_ids": task_pack_ids,
         },
     )
     return {**document, "summary_id": _digest(document)}
+
+
+def _parse_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("campaign timestamp must include a timezone")
+    return parsed
 
 
 def _verified_members(campaign_root: Path, records: list[JSONObject]) -> list[dict[str, Any]]:
