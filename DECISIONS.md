@@ -358,3 +358,9 @@ state the same rule so factual feedback repairs the responsible checker project.
 Checkpoint A is split at a real responsibility boundary: A1 owns canonical
 Goal truth and domain-free evaluation; A2 will own public AnswerProjection and
 TaskDraft materialization. Neither is connected to the legacy Checker path.
+
+`s2-task-draft-a2|介入0|返工0|required target+public AnswerProjection+Host type-only schema+4 mutation licences|红线违反0`
+
+Sampling output cannot contain an answer schema or protected truth. The Host
+resolves a JSON-only AnswerProjection against exact public sources and derives
+the wire schema; empty arrays require their public source item schema.
