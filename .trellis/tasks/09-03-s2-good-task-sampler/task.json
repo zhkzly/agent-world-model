@@ -12,9 +12,9 @@
   "assignee": "kelong",
   "createdAt": "2026-09-03",
   "completedAt": null,
-  "branch": null,
+  "branch": "s2-good-task-sampler",
   "base_branch": "s1-s2-authority-realignment",
-  "worktree_path": null,
+  "worktree_path": "/home/kelong/pycodes/foundry-s1-s2-authority-realignment",
   "commit": null,
   "pr_url": null,
   "subtasks": [],
@@ -27,7 +27,7 @@
     ".trellis/tasks/09-03-s2-good-task-sampler/implement.md",
     ".trellis/tasks/09-03-s2-good-task-sampler/research/git-sampler-causal-audit.md"
   ],
-  "notes": "Planning only. Implementation requires a fresh user approval after final plan review.",
+  "notes": "Final no-Graph plan approved; implementation active on s2-good-task-sampler. Checkpoint A1 is the first isolated slice.",
   "meta": {
     "compatibility": "clean-break",
     "s1_campaign_id": "486dd2349f1eccb2f2ee096447a7c2325e811ecd92b6189722a69ed49a09ad7d",

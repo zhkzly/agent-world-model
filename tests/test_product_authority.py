@@ -12,7 +12,7 @@ def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def test_archived_s2_authority_keeps_graph_and_programmatic_optional() -> None:
+def test_current_s2_authority_has_no_graph_or_programmatic_product_path() -> None:
     documents = (
         ROOT / "PROJECT.md",
         ROOT / ".trellis/tasks/08-26-foundry-paper-product/prd.md",
@@ -31,7 +31,9 @@ def test_archived_s2_authority_keeps_graph_and_programmatic_optional() -> None:
         "direct + Graph + Programmatic grounded proposals",
     )
     assert all(value not in combined for value in forbidden)
-    assert "Graph and Programmatic are optional" in _text(ROOT / "PROJECT.md")
+    project = _text(ROOT / "PROJECT.md")
+    assert "S2 uses no Tool Graph, random walk" in project
+    assert "generated TaskSemantics" in project
     assert "Optional sampler experiments" in _text(S2_TASK / "implement.md")
 
 
@@ -117,22 +119,20 @@ def test_environment_semantic_qualification_contains_no_domain_branch() -> None:
 def test_current_product_authority_separates_s1_environment_from_s2_task_truth() -> None:
     project = _text(ROOT / "PROJECT.md")
     s1 = project.split("## S1 owns the executable environment", 1)[1].split(
-        "## S2 owns sampling good Tasks", 1
+        "## S2 owns sampling Good Tasks", 1
     )[0]
-    s2 = project.split("## S2 owns sampling good Tasks", 1)[1].split(
+    s2 = project.split("## S2 owns sampling Good Tasks", 1)[1].split(
         "## S3 owns verified policy Episodes", 1
     )[0]
 
-    for prohibited in (
-        "CapabilitySpecs",
-        "TaskSemantics",
-        "task-specific auditors",
-        "positive/noop Task cases",
-    ):
-        assert prohibited in s1
-    assert "does not publish CapabilitySpecs" in s1
-    assert "one checker project" in s2.casefold()
-    assert "failed task candidate never invalidates" in s2.casefold()
+    assert "does not publish TaskSpace" in s1
+    assert "CapabilitySpecs" in s1
+    assert "Task-specific checkers" in s1
+    assert "not a complete\nTaskSpace" in s1
+    assert "generic Sampling Agent" in s2
+    assert "Host derives a type-only final-answer schema" in s2
+    assert "no Tool Graph" in s2
+    assert "per-Task Checker" in s2
 
 
 def test_current_backend_specs_expose_only_v3_environment_authority() -> None:

@@ -352,3 +352,9 @@ choice from the evaluated trace/final answer. Host source checks reject an ID
 literal that appears in proposal public evidence but not in the public
 instruction; explicitly named targets remain legal. Proposal and checker Skills
 state the same rule so factual feedback repairs the responsible checker project.
+
+`s2-common-goal-a1|介入1|返工1|four real-derived Goal shapes+exact state/answer+7 mutation licences; monolith 1190→~730 LOC|红线违反0`
+
+Checkpoint A is split at a real responsibility boundary: A1 owns canonical
+Goal truth and domain-free evaluation; A2 will own public AnswerProjection and
+TaskDraft materialization. Neither is connected to the legacy Checker path.
