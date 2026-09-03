@@ -1,11 +1,11 @@
 # Raw-requirement checklist
-- [ ] Does S2 sample real Tasks by a generic Agent actually using each environment?
-- [ ] Is Agent exploration target-driven rather than random or Tool-Graph-driven?
-- [ ] Are Atom, All, If, and ForEach retained as real Task shapes?
-- [ ] Does Framework handle deterministic schema, evidence, replay, evaluation, and identity work?
-- [ ] Is every Candidate publicly solvable before it exists and independently recoverable in at least 2/5 runs?
-- [ ] Are final state and final answer real execution results rather than LLM assertions?
-- [ ] Are generated Checker/TaskSemantics/per-Task pressure and domain hardcoding absent?
-- [ ] Are S1 diagnostics excluded as Task templates and S1/S3 responsibilities unchanged?
-- [ ] Does the final run cover all 20 frozen releases with honest yield, failure, diversity, cost, and difficulty evidence?
-- [ ] Is completion a publishable semantic result rather than a demo, mock, compatibility path, or green-only claim?
+- [x] Does S2 sample real Tasks by a generic Agent actually using each environment?
+- [x] Is Agent exploration target-driven rather than random or Tool-Graph-driven?
+- [x] Are Atom, All, If, and ForEach retained as real Task shapes?
+- [x] Does Framework handle deterministic schema, evidence, replay, evaluation, and identity work?
+- [x] Is every Candidate publicly solvable before it exists and independently recoverable in at least 2/5 runs?
+- [x] Are final state and final answer real execution results rather than LLM assertions?
+- [x] Are generated Checker/TaskSemantics/per-Task pressure and domain hardcoding absent?
+- [x] Are S1 diagnostics excluded as Task templates and S1/S3 responsibilities unchanged?
+- [x] Does the final run cover all 20 frozen releases with honest yield, failure, diversity, cost, and difficulty evidence?
+- [x] Is completion a publishable semantic result rather than a demo, mock, compatibility path, or green-only claim?

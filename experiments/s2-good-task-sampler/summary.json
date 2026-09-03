@@ -1,0 +1,122 @@
+{
+  "format": "s2-good-task-resume-evidence/1",
+  "source_commit": "14f76fc1b8f685dbbef7d39ef058a89c3350313f",
+  "s1_campaign_id": "486dd2349f1eccb2f2ee096447a7c2325e811ecd92b6189722a69ed49a09ad7d",
+  "campaign_config_id": "4453f83c7126724c6e695dd3ee402c270d30e652dcf8d2a1425a0a94aefb08b8",
+  "summary_id": "ae8f2b4c2baa21b47755ab3dc42cc6168a73399f66c0ebdca9ceb39803dd1747",
+  "corpus_manifest_id": "7ce6f07703acf6a60f4c67ff784f18bfac75821f1c47ba979fc7a553288f186e",
+  "artifact_root": "/home/kelong/pycodes/foundry-s2-good-task-20release-final-v5/4453f83c7126724c6e695dd3ee402c270d30e652dcf8d2a1425a0a94aefb08b8",
+  "configuration": {
+    "model": "gpt-5.6-luna",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "seed": 17,
+    "release_workers": 8,
+    "base_attempts_per_release": 15,
+    "minimum_packs_per_release": 1,
+    "recovery_attempt_budget": 15,
+    "filter_runs_per_candidate": 5,
+    "minimum_filter_passes": 2
+  },
+  "result": {
+    "environment_releases": 20,
+    "covered_environment_releases": 20,
+    "base_attempts": 300,
+    "recovery_attempts": 0,
+    "sampled_drafts": 125,
+    "fresh_replay_candidates": 89,
+    "admitted_task_packs": 69,
+    "unique_structures": 69,
+    "sampling_yield": 0.4166666666666667,
+    "sample_to_candidate_rate": 0.712,
+    "candidate_admission_rate": 0.7752808988764045,
+    "end_to_end_attempt_yield": 0.23
+  },
+  "terminal_counts": {
+    "admitted": 69,
+    "DraftRejected": 200,
+    "PolicyRejected": 19,
+    "SamplingUnsupported": 11,
+    "DuplicateStructure": 1,
+    "FrameworkDefect": 0,
+    "InfrastructureFailure": 0
+  },
+  "goal_distribution": {
+    "atom": 32,
+    "all": 17,
+    "if": 19,
+    "foreach": 1
+  },
+  "outcome_distribution": {
+    "query": 28,
+    "transition": 25,
+    "refusal": 16
+  },
+  "filter": {
+    "valid_policy_runs": 440,
+    "passing_policy_runs": 332,
+    "policy_pass_rate": 0.7545454545454545
+  },
+  "tool_coverage": {
+    "available_release_tool_identities": 206,
+    "attempted_focus_tool_identities": 202,
+    "admitted_objective_tool_identities": 74
+  },
+  "cost": {
+    "input_tokens": 8449752,
+    "output_tokens": 607805,
+    "total_tokens": 9057557,
+    "sampling_provider_turns": 1384,
+    "filter_provider_turns": 1382,
+    "sampling_public_tool_calls": 1623,
+    "filter_public_tool_calls": 1321,
+    "total_public_tool_calls": 2944,
+    "mean_total_tokens_per_admitted_task": 131269,
+    "mean_public_tool_calls_per_admitted_task": 43,
+    "mean_provider_turns_per_admitted_task": 40
+  },
+  "latency_ms": {
+    "wall_clock": 2647950,
+    "cumulative_release_work": 17042921,
+    "mean_per_release": 852146,
+    "p50_per_release": 829815,
+    "p95_per_release": 1042071
+  },
+  "artifact_size_bytes": {
+    "task_packs_total": 3716784,
+    "task_pack_mean": 53866,
+    "task_pack_median": 53149,
+    "task_pack_min": 20941,
+    "task_pack_max": 98468
+  },
+  "validation": {
+    "cold_read_task_packs": 69,
+    "relocated_cold_read_task_packs": 69,
+    "manifest_rebuild_equal": true,
+    "summary_rebuild_equal": true,
+    "public_view_leaks": 0,
+    "release_id_coverage": 20
+  },
+  "per_release": {
+    "need-01-library-circulation": 2,
+    "need-02-inventory-reservation": 2,
+    "need-03-expense-approval": 4,
+    "need-04-access-requests": 3,
+    "need-05-support-sla": 6,
+    "need-06-clinic-appointments": 3,
+    "need-07-product-returns": 5,
+    "need-08-purchase-orders": 4,
+    "need-09-incident-response": 2,
+    "need-10-subscription-cancellation": 5,
+    "need-11-git-release-workspace": 4,
+    "need-12-document-review": 2,
+    "need-13-lab-chain-of-custody": 6,
+    "need-14-fleet-inspections": 5,
+    "need-15-equipment-loans": 1,
+    "need-16-insurance-claims": 2,
+    "need-17-table-reservations": 1,
+    "need-18-customs-documents": 3,
+    "need-19-course-enrollment": 4,
+    "need-20-property-maintenance": 5
+  },
+  "claim_boundary": "This result establishes S2 Good-Task sampling, fresh replay, common evaluation, 2-of-5 public recoverability, checker-free TaskPack publication, and 20-Release corpus coverage. It does not claim S3 trajectory/reward integration or downstream SFT/RL improvement."
+}

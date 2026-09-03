@@ -22,6 +22,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [S1 Coordinator](./s1-coordinator.md) | Need anchoring, standalone uv workspace, fail-closed cold publication | Active |
 | [V3 Preparation](./v3-preparation.md) | One locked actor runtime with public tools and protected task-neutral state readback | Active |
 | [V3 Conformance/Publication](./v3-conformance-publication.md) | Environment-only physical conformance, strict receipt and cold publication | Active |
+| [S2 Good-Task Sampler](./s2-good-task-sampler.md) | Execution-first Task sampling, common Goal evaluation and checker-free TaskPack admission | Active |
 | [S3 Episode Runtime](./s3-episode-runtime.md) | Exact policy capture, close/reopen reward, paired view and serial Corpus batch | Active |
 
 ---
