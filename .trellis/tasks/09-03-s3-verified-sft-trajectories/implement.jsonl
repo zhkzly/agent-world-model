@@ -1,0 +1,6 @@
+{"file":"PROJECT.md","reason":"Stable S1/S2/S3/S4 product boundaries and semantic completion criteria."}
+{"file":".trellis/spec/backend/s2-good-task-sampler.md","reason":"Current TaskPack truth, public projection and prohibition on using S2 filter evidence as S3 Episodes."}
+{"file":".trellis/spec/backend/v3-preparation.md","reason":"Current Release preparation, fresh native instance and protected state-reader contract."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace current Release/TaskPack authority into trusted and public Episode artifacts without duplicated readers."}
+{"file":".trellis/tasks/09-03-s3-verified-sft-trajectories/prd.md","reason":"Frozen requirements, inputs, outputs and acceptance criteria."}
+{"file":".trellis/tasks/09-03-s3-verified-sft-trajectories/design.md","reason":"Clean-break multi-Release Episode runtime and SFT handoff design."}

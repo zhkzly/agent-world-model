@@ -1,0 +1,6 @@
+{"file":"PROJECT.md","reason":"Audit product intent, stage ownership and semantic completion."}
+{"file":".trellis/spec/backend/s2-good-task-sampler.md","reason":"Ensure S3 does not reinterpret Task truth or expose S2 evidence."}
+{"file":".trellis/spec/backend/v3-preparation.md","reason":"Audit fresh reset, same-instance reopen and protected state boundaries."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Audit the complete authority flow and reject duplicate payload readers."}
+{"file":".trellis/tasks/09-03-s3-verified-sft-trajectories/prd.md","reason":"Check every acceptance criterion against physical evidence."}
+{"file":".trellis/tasks/09-03-s3-verified-sft-trajectories/design.md","reason":"Check clean-break contracts, reward precedence, multi-Release batching and SFT leakage."}

@@ -1,0 +1,30 @@
+{
+  "id": "s3-verified-sft-trajectories",
+  "name": "s3-verified-sft-trajectories",
+  "title": "S3 Verified SFT Trajectories",
+  "description": "Collect 552 fresh Luna Episodes from the exact 69-TaskPack corpus and publish verified tokenizer-neutral SFT trajectories.",
+  "status": "planning",
+  "dev_type": null,
+  "scope": "Current multi-release TaskPack-to-Episode runtime and 552-rollout Luna campaign",
+  "package": null,
+  "priority": "P0",
+  "creator": "kelong",
+  "assignee": "kelong",
+  "createdAt": "2026-09-03",
+  "completedAt": null,
+  "branch": "s3-sft-trajectories",
+  "base_branch": "s2-good-task-sampler",
+  "worktree_path": "/home/kelong/pycodes/foundry-s3-sft-trajectories",
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "s1_campaign_id": "486dd2349f1eccb2f2ee096447a7c2325e811ecd92b6189722a69ed49a09ad7d",
+    "s2_corpus_manifest_id": "7ce6f07703acf6a60f4c67ff784f18bfac75821f1c47ba979fc7a553288f186e",
+    "rollout_slots": "552"
+  }
+}
