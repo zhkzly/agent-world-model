@@ -173,6 +173,39 @@ one execution for two ForEach members -> foreach member/coverage failures
 - These 20/20 solver passes establish cross-environment feasibility, not final
   corpus diversity or difficulty. Those remain campaign measurements.
 
+## Checkpoint B implementation canaries
+
+The production `sample_task_draft` path was then exercised against two
+non-Git releases, with no Checker or Agent-authored answer schema:
+
+| Release | Required target | Result |
+|---|---|---|
+| support SLA | If / assign_ticket / transition | 4 provider turns; business condition `/data/tickets/1/assignee_id == null`; valid TaskDraft and Host answer schema |
+| inventory reservation | ForEach / release / transition | 5 provider turns; complete initial reservation set; two member executions; valid empty-array schema from ToolSpec |
+
+The first support attempt had already completed
+`list_tickets -> assign_ticket -> inspect_ticket`, but the terminal repeatedly
+used an invented `shape/steps` JSON format because the opaque `goal_json`
+contract had not been disclosed. Generic feedback contained only
+`DraftGoal has unsupported kind`, so continuation grew from about 24 KB to
+78 KB over repeated rewrites and looked like a provider hang.
+
+Single-turn ablations using the same support input showed:
+
+```text
+old prompt + old schema  3.63 s
+new prompt + old schema  3.44 s
+old prompt + new schema  2.74 s
+new prompt + new schema  4.26 s
+```
+
+The fix was context/feedback ownership, not model or environment changes:
+Framework now supplies the exact legal template for the requested shape,
+returns rejected output + exact condition + template together, and stops on a
+repeated terminal error. It also rejects ToolObservation `/ok` as an If
+business condition. The next support attempt emitted the correct business
+scalar in one terminal turn.
+
 ## Decision
 
 - Execution-first generic Agent sampling is physically plausible across

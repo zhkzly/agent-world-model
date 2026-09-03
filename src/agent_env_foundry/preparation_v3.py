@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import stat
 import uuid
@@ -9,9 +10,9 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 
-from agent_env_foundry.environment import JSONValue
+from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.environment_semantic_qualification import SemanticQualification
 from agent_env_foundry.physical_runtime import (
     ActorProxy as ActorProxyV3,
@@ -128,6 +129,13 @@ class OpenPreparedReleaseV3:
     @property
     def semantic_qualification(self) -> SemanticQualification:
         return self._release.semantic_evidence.qualification
+
+    @property
+    def reset_observation_schema(self) -> JSONObject:
+        return cast(
+            JSONObject,
+            json.loads(json.dumps(self._release.reset_observation_schema, ensure_ascii=False)),
+        )
 
     def open(self, instance_directory: Path) -> OpenPreparedSessionV3:
         _verify_runtime(self._actor, self._settings.command_timeout_seconds)

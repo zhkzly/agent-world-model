@@ -193,6 +193,8 @@ class IfDraft:
     def __post_init__(self) -> None:
         if self.condition.kind == "task_literal" or self.operator not in _OPERATORS:
             raise ValueError("IfDraft requires a public condition and supported operator")
+        if self.condition.kind == "observation" and self.condition.pointer == "/ok":
+            raise ValueError("IfDraft condition must be a business data scalar, not transport ok")
         if isinstance(self.value, (dict, list)) or not is_json_value(self.value):
             raise ValueError("IfDraft comparison value must be a JSON scalar")
         branches = (self.then_goal, self.else_goal)
@@ -339,6 +341,31 @@ def task_draft_from_document(document: Any) -> TaskDraft:
         _draft_goal_from_document(value["goal"]),
         _projection_from_document(value["answer"]),
     )
+
+
+def draft_goal_shape(goal: DraftGoal) -> GoalShape:
+    if not _is_draft_goal(goal):
+        raise TypeError("goal must be a DraftGoal")
+    if isinstance(goal, AtomDraft):
+        return "atom"
+    if isinstance(goal, AllDraft):
+        return "all"
+    if isinstance(goal, IfDraft):
+        return "if"
+    return "foreach"
+
+
+def draft_atom_steps(goal: DraftGoal) -> tuple[int, ...]:
+    if isinstance(goal, AtomDraft):
+        return (goal.step,)
+    if isinstance(goal, AllDraft):
+        return tuple(step for child in goal.children for step in draft_atom_steps(child))
+    if isinstance(goal, IfDraft):
+        branches = (goal.then_goal, goal.else_goal)
+        return tuple(
+            step for branch in branches if branch is not None for step in draft_atom_steps(branch)
+        )
+    return tuple(child.step for child in goal.children)
 
 
 def _materialize(
@@ -697,6 +724,8 @@ __all__ = [
     "PublicValueRef",
     "SamplingTarget",
     "TaskDraft",
+    "draft_atom_steps",
+    "draft_goal_shape",
     "materialize_answer",
     "sampling_target_from_document",
     "task_draft_from_document",

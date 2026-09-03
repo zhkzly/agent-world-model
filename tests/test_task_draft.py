@@ -9,6 +9,7 @@ from agent_env_foundry.task_draft import (
     AnswerProjection,
     AtomDraft,
     ForEachDraft,
+    IfDraft,
     PublicValueRef,
     SamplingTarget,
     TaskDraft,
@@ -258,4 +259,15 @@ def test_foreach_draft_requires_public_members_and_one_atom_per_member_slot() ->
             "/reservation_id",
             "/reservation_id",
             (AtomDraft(4),),
+        )
+
+
+def test_if_draft_rejects_transport_success_as_a_business_condition() -> None:
+    with pytest.raises(ValueError, match="business data scalar"):
+        IfDraft(
+            condition=PublicValueRef.observation(1, "/ok"),
+            operator="eq",
+            value=True,
+            then_goal=AtomDraft(2),
+            else_goal=None,
         )

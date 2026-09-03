@@ -364,3 +364,10 @@ TaskDraft materialization. Neither is connected to the legacy Checker path.
 Sampling output cannot contain an answer schema or protected truth. The Host
 resolves a JSON-only AnswerProjection against exact public sources and derives
 the wire schema; empty arrays require their public source item schema.
+
+`s2-execution-first-sampling-b|介入2|返工1|required target+exact terminal context+two-strike stop+support/inventory live+7 mutation licences|红线违反0`
+
+The Sampling Agent receives business-only BuilderProjection fields plus the
+exact target-specific DraftGoal and AnswerProjection forms. Rejected terminal,
+exact error and valid form travel together; repeated encoding failure stops
+instead of accumulating opaque continuation history.

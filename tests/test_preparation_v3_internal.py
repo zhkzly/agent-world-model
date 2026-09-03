@@ -46,6 +46,7 @@ def test_internal_v3_directory_zip_relocation_and_protected_state(tmp_path: Path
         == zipped.semantic_qualification.builder_projection_digest
     )
     assert zipped.builder_projection.to_document()["requirements"][0]["id"] == "REQ-001"
+    assert zipped.reset_observation_schema == release.reset_observation_schema
 
     instance = tmp_path / "instance"
     with zipped.open(instance) as session:
