@@ -194,7 +194,7 @@ def materialize_candidate(
             "sampling_release_mismatch",
             "sampling evidence belongs to another Release",
         )
-    origins = _derive_origins(
+    origins = derive_argument_origins(
         evidence.public_trace,
         reset=evidence.reset_observation,
         instruction=sampled.draft.instruction,
@@ -380,7 +380,7 @@ def candidate_task_from_document(document: Any) -> CandidateTask:
     )
 
 
-def _derive_origins(
+def derive_argument_origins(
     trace: tuple[TraceEvent, ...],
     *,
     reset: JSONValue,
@@ -640,7 +640,7 @@ def _value_ref_from_document(document: Any) -> PublicValueRef:
     raise ValueError("ArgumentOrigin source has invalid fields")
 
 
-def _origin_from_document(document: Any) -> ArgumentOrigin:
+def argument_origin_from_document(document: Any) -> ArgumentOrigin:
     value = _exact(document, {"step", "argument_pointer", "source"}, "ArgumentOrigin")
     return ArgumentOrigin(
         cast(int, value["step"]),
@@ -687,6 +687,8 @@ __all__ = [
     "CandidateTask",
     "MaterializedCandidate",
     "ReferenceReplay",
+    "argument_origin_from_document",
     "candidate_task_from_document",
+    "derive_argument_origins",
     "materialize_candidate",
 ]

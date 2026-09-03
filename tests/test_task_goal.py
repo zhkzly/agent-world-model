@@ -329,6 +329,62 @@ def test_support_if_requires_a_prior_public_scalar_and_selected_branch() -> None
     assert evaluate_goal(false_truth, false_context).passed
 
 
+def test_if_accepts_an_equivalent_public_condition_route_for_the_same_target() -> None:
+    assign = AtomGoal(
+        "assign_ticket",
+        {"ticket_id": "ticket-2", "assignee_id": "agent-1"},
+        "transition",
+    )
+    goal = IfGoal(
+        ScalarCondition(
+            GoalValueSource.observation("list_tickets", {}, "/data/tickets/1/overdue"),
+            "eq",
+            True,
+        ),
+        then_goal=assign,
+        else_goal=None,
+    )
+    before = {"tickets": {"ticket-2": {"assignee_id": None, "overdue": True}}}
+    after = {"tickets": {"ticket-2": {"assignee_id": "agent-1", "overdue": True}}}
+    answer = {"ticket_id": "ticket-2", "assignee_id": "agent-1"}
+    truth = _truth(
+        goal,
+        before=before,
+        after=after,
+        answer=answer,
+        answer_schema=_schema({"ticket_id": {"type": "string"}, "assignee_id": {"type": "string"}}),
+    )
+    alternate = _context(
+        before=before,
+        after=after,
+        trace=(
+            _event(
+                1,
+                "list_overdue_tickets",
+                {},
+                _ok({"tickets": [{"ticket_id": "ticket-2", "overdue": True}]}),
+            ),
+            _event(2, assign.tool_name, assign.arguments, _ok({"assignee_id": "agent-1"})),
+        ),
+        answer=answer,
+    )
+    assert evaluate_goal(truth, alternate).passed
+
+    unrelated = replace(
+        alternate,
+        trace=(
+            _event(
+                1,
+                "list_overdue_tickets",
+                {},
+                _ok({"tickets": [{"ticket_id": "ticket-99", "overdue": True}]}),
+            ),
+            alternate.trace[1],
+        ),
+    )
+    assert "condition_unresolved" in evaluate_goal(truth, unrelated).reason_codes
+
+
 def test_inventory_foreach_requires_exact_initial_member_bijection() -> None:
     source = GoalValueSource.observation("list-reservations", {}, "/data/reservations")
     first = AtomGoal(

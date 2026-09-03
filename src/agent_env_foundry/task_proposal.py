@@ -31,6 +31,8 @@ from agent_env_foundry.schema import (
 )
 from agent_env_foundry.task_draft import (
     TASK_DRAFT_FORMAT,
+    AnswerProjection,
+    PublicValueRef,
     SamplingTarget,
     TaskDraft,
     draft_atom_steps,
@@ -75,7 +77,10 @@ actually depends on and must occur before the branch objective. Never use ToolOb
 After real execution, return status=draft with the natural instruction, goal_json, and
 answer_json. Goal step numbers are one-based public call positions. answer_json is an
 AnswerProjection that only copies or assembles Task/reset/ToolObservation JSON; it cannot
-compute, relabel, or assert new facts. Do not author an answer schema, Checker, reward,
+compute, relabel, or assert new facts. For every direct source field, use an output key that
+matches the final semantic token of its public JSON pointer: for example, source
+/data/assignee_id must be named assignee_id, never a generic result or value key. Do not
+author an answer schema, Checker, reward,
 protected-state expectation, Python code, or admission verdict.
 
 The user input contains task_draft_contract with the exact Goal and AnswerProjection syntax
@@ -662,12 +667,12 @@ def _task_draft_contract(target: SamplingTarget) -> JSONObject:
         "answer_projection_example": {
             "kind": "object",
             "fields": {
-                "result": {
+                "entity_id": {
                     "kind": "source",
                     "source": {
                         "kind": "observation",
                         "step": 1,
-                        "pointer": "/data/public_result",
+                        "pointer": "/data/entity_id",
                     },
                 }
             },
@@ -757,6 +762,49 @@ def _validate_sampled_draft(
                 "objective observation does not satisfy the required outcome",
                 step=event.seq,
             )
+    mismatch = _answer_field_source_mismatch(draft.answer)
+    if mismatch is not None:
+        field, pointer = mismatch
+        raise SamplingFailure(
+            "DraftRejected",
+            "draft_answer_field_source_mismatch",
+            "a direct answer field must name the semantic leaf of its public source",
+            field=field,
+            source_pointer=pointer,
+        )
+
+
+def _answer_field_source_mismatch(
+    projection: AnswerProjection,
+) -> tuple[str, str] | None:
+    if projection.kind == "object":
+        for field, child in projection.fields:
+            if child.kind == "source":
+                source = cast(PublicValueRef, child.source)
+                pointer = source.pointer
+                leaf = _semantic_pointer_leaf(pointer) if source.kind != "task_literal" else None
+                if leaf is not None and _semantic_name(field) != _semantic_name(leaf):
+                    return field, cast(str, pointer)
+            nested = _answer_field_source_mismatch(child)
+            if nested is not None:
+                return nested
+    elif projection.kind == "array":
+        for child in projection.items:
+            nested = _answer_field_source_mismatch(child)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _semantic_pointer_leaf(pointer: str | None) -> str | None:
+    if not pointer:
+        return None
+    token = pointer.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~")
+    return None if token.isdecimal() or token in {"data", "error"} else token
+
+
+def _semantic_name(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())
 
 
 def _nested_object(value: Any, role: str) -> JSONObject:

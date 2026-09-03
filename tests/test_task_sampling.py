@@ -208,6 +208,39 @@ def test_sampling_agent_must_execute_then_emit_a_grounded_task_draft(tmp_path) -
     assert contract["answer_projection_example"]["kind"] == "object"
 
 
+def test_direct_answer_field_must_name_its_public_source_leaf(tmp_path) -> None:
+    terminal = _terminal()
+    terminal["answer_json"] = json.dumps(
+        {
+            "kind": "object",
+            "fields": {
+                "result": {
+                    "kind": "source",
+                    "source": {
+                        "kind": "observation",
+                        "step": 1,
+                        "pointer": "/data/count",
+                    },
+                }
+            },
+        }
+    )
+    client = Client([Response([_call()]), Response([], json.dumps(terminal))])
+
+    with pytest.raises(SamplingFailure) as caught:
+        sample_task_draft(
+            Prepared(),
+            development_brief={"need": "Maintain a persistent counter."},
+            target=_target(),
+            instance_directory=tmp_path / "instance",
+            route=AgentRoute(),
+            client_factory=lambda **kwargs: client,
+        )
+
+    assert caught.value.kind == "DraftRejected"
+    assert caught.value.code == "draft_answer_field_source_mismatch"
+
+
 def test_sampling_agent_receives_business_context_without_research_audit_metadata(
     tmp_path,
 ) -> None:

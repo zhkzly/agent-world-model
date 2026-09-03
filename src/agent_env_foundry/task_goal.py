@@ -414,7 +414,11 @@ def _evaluate_node(
 def _evaluate_if(
     goal: IfGoal, context: EvaluationContext, used: frozenset[int]
 ) -> tuple[bool, tuple[str, ...], frozenset[int]]:
-    candidates = _source_candidates(goal.condition.source, context)
+    candidates = _source_candidates(
+        goal.condition.source,
+        context,
+        alternate_anchors=_goal_argument_anchors(goal),
+    )
     if any(isinstance(value, (dict, list)) for value, _ in candidates):
         return False, ("condition_not_scalar",), used
     for value, source_seq in reversed(candidates):
@@ -488,7 +492,10 @@ def _outcome_matches(outcome: OutcomeClass, code: str | None, event: TraceEvent)
 
 
 def _source_candidates(
-    source: GoalValueSource, context: EvaluationContext
+    source: GoalValueSource,
+    context: EvaluationContext,
+    *,
+    alternate_anchors: tuple[tuple[str, JSONValue], ...] = (),
 ) -> list[tuple[JSONValue, int]]:
     if source.kind == "reset":
         try:
@@ -503,7 +510,62 @@ def _source_candidates(
             result.append((_pointer_value(event.observation, source.pointer), event.seq))
         except (KeyError, IndexError, TypeError, ValueError):
             pass
+    if result or not alternate_anchors:
+        return result
+    leaf = _pointer_leaf(source.pointer)
+    if leaf is None:
+        return []
+    anchors = tuple((key, value) for key, value in alternate_anchors if key != leaf)
+    if not anchors:
+        return []
+    for event in sorted(context.trace, key=lambda item: item.seq):
+        for node in _object_nodes(event.observation):
+            if leaf not in node or not any(
+                key in node and _same(node[key], value) for key, value in anchors
+            ):
+                continue
+            result.append((node[leaf], event.seq))
     return result
+
+
+def _goal_argument_anchors(goal: Goal) -> tuple[tuple[str, JSONValue], ...]:
+    anchors: list[tuple[str, JSONValue]] = []
+    for atom in _goal_atoms(goal):
+        for key, value in atom.arguments.items():
+            if value is None or isinstance(value, (bool, dict, list)):
+                continue
+            pair = (key, value)
+            if not any(key == prior_key and _same(value, prior) for prior_key, prior in anchors):
+                anchors.append(pair)
+    return tuple(anchors)
+
+
+def _goal_atoms(goal: Goal) -> tuple[AtomGoal, ...]:
+    if isinstance(goal, AtomGoal):
+        return (goal,)
+    if isinstance(goal, AllGoal):
+        return tuple(atom for child in goal.children for atom in _goal_atoms(child))
+    if isinstance(goal, IfGoal):
+        return tuple(
+            atom
+            for branch in (goal.then_goal, goal.else_goal)
+            if branch is not None
+            for atom in _goal_atoms(branch)
+        )
+    return goal.children
+
+
+def _pointer_leaf(pointer: str) -> str | None:
+    token = pointer.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~")
+    return None if not token or token.isdecimal() or token in {"data", "error"} else token
+
+
+def _object_nodes(value: JSONValue) -> list[JSONObject]:
+    if isinstance(value, dict):
+        return [value, *(node for child in value.values() for node in _object_nodes(child))]
+    if isinstance(value, list):
+        return [node for child in value for node in _object_nodes(child)]
+    return []
 
 
 def _compare(left: JSONValue, operator: ScalarOperator, right: JSONValue) -> bool | None:
