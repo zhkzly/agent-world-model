@@ -303,6 +303,36 @@ def test_machine_delimited_string_literal_does_not_require_extra_quotes() -> Non
     assert origins[0].source == PublicValueRef.task_literal("counter-2")
 
 
+def test_observation_sourced_free_text_is_ambiguous_when_instruction_mentions_it_unquoted() -> None:
+    trace = (
+        TraceEvent(
+            1,
+            "list_requests",
+            {},
+            success_observation({"items": [{"issue": "broken heater"}]}),
+        ),
+        TraceEvent(
+            2,
+            "open_request",
+            {"issue": "broken heater"},
+            {
+                "ok": False,
+                "data": None,
+                "error": {"code": "INACTIVE_TENANCY", "message": "inactive"},
+            },
+        ),
+    )
+
+    with pytest.raises(CandidateMaterializationFailure) as caught:
+        derive_argument_origins(
+            trace,
+            reset={},
+            instruction="Open a request for the broken heater.",
+        )
+
+    assert caught.value.code == "argument_literal_not_explicit"
+
+
 def test_unexplained_sampling_mutation_is_not_folded_into_goal(tmp_path) -> None:
     events = (
         TraceEvent(

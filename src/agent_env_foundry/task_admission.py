@@ -630,7 +630,7 @@ def _filter_attempt(
             instruction=candidate.instruction,
         )
     except CandidateMaterializationFailure as exc:
-        if exc.code != "argument_source_unresolved":
+        if exc.code not in {"argument_source_unresolved", "argument_literal_not_explicit"}:
             raise TaskAdmissionFailure("FrameworkDefect", exc.code, str(exc)) from exc
         origins = ()
         failure_codes.append(exc.code)

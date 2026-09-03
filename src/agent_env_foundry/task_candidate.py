@@ -398,24 +398,23 @@ def derive_argument_origins(
     origins: list[ArgumentOrigin] = []
     for event in trace:
         for pointer, value in _leaves(event.arguments):
-            source = next(
-                (ref for ref, available in visible if _same(available, value)),
-                None,
-            )
             if (
-                source is None
-                and isinstance(value, str)
+                isinstance(value, str)
                 and value in instruction
                 and not _literal_disclosed(value, instruction)
             ):
                 raise CandidateMaterializationFailure(
                     "DraftRejected",
                     "argument_literal_not_explicit",
-                    "a task-owned string argument must be quoted as an exact literal",
+                    "a mentioned free-text argument must be quoted as an exact literal",
                     step=event.seq,
                     argument_pointer=pointer,
                     literal=value,
                 )
+            source = next(
+                (ref for ref, available in visible if _same(available, value)),
+                None,
+            )
             if source is None and _literal_disclosed(value, instruction):
                 source = PublicValueRef.task_literal(value)
             if source is None:
