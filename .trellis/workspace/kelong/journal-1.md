@@ -98,3 +98,25 @@ Completed deletion-first S3: exact policy capture, real close/reopen Task verifi
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: Complete S2 Good-Task Sampler
+
+**Date**: 2026-09-03
+**Task**: Complete S2 Good-Task Sampler
+**Branch**: `s2-good-task-sampler`
+
+### Summary
+
+Completed and verified the 20-release execution-first sampler: 300 attempts produced 69 unique checker-free TaskPacks with 20/20 coverage, exact report/manifest binding, and local plus relocated cold-read validation.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `14f76fc` | (see git log) |
+| `795a31e` | (see git log) |
+
+### Status
+
+[OK] **Completed**
