@@ -1,0 +1,7 @@
+{"file":"PROJECT.md","reason":"Check the implementation against the stable semantic-completion and trust-separation target."}
+{"file":".trellis/tasks/09-03-s2-good-task-sampler/prd.md","reason":"Check every observable Good Task and 20-release acceptance requirement."}
+{"file":".trellis/tasks/09-03-s2-good-task-sampler/design.md","reason":"Audit sampling executability, common evaluator soundness, concurrency and S3 handoff."}
+{"file":".trellis/tasks/09-03-s2-good-task-sampler/implement.md","reason":"Verify checkpoints were completed in order with real exits and clean-break deletion."}
+{"file":".trellis/tasks/09-03-s2-good-task-sampler/research/git-sampler-causal-audit.md","reason":"Ensure the change restores Goal sampling without reviving generated checker/TaskSemantics failures."}
+{"file":".trellis/tasks/09-03-s2-good-task-sampler/research/no-graph-cross-environment-probe.md","reason":"Check that the implementation generalizes across real Release families without Tool Graph or domain-specific code."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Review Goal/evidence/TaskPack fields across producer and consumer boundaries."}

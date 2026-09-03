@@ -1,0 +1,44 @@
+{
+  "id": "s2-good-task-sampler",
+  "name": "s2-good-task-sampler",
+  "title": "S2 Good Task Sampler",
+  "description": "Use one generic execution-first Sampling Agent to produce Atom/All/If/ForEach Task drafts, freeze and replay them through one common evaluator, apply 2-of-5 public filtering, and publish a resume-grade 20-release corpus",
+  "status": "in_progress",
+  "dev_type": "backend",
+  "scope": "Clean-break S2 sampler over the frozen 20-release S1 campaign; no generated checker, TaskSemantics, pressure-test path, S3 reward or compatibility",
+  "package": "agent_env_foundry",
+  "priority": "P0",
+  "creator": "kelong",
+  "assignee": "kelong",
+  "createdAt": "2026-09-03",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "s1-s2-authority-realignment",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": "08-26-foundry-paper-product",
+  "relatedFiles": [
+    "PROJECT.md",
+    ".trellis/tasks/09-03-s2-good-task-sampler/prd.md",
+    ".trellis/tasks/09-03-s2-good-task-sampler/design.md",
+    ".trellis/tasks/09-03-s2-good-task-sampler/implement.md",
+    ".trellis/tasks/09-03-s2-good-task-sampler/research/git-sampler-causal-audit.md"
+  ],
+  "notes": "Planning only. Implementation requires a fresh user approval after final plan review.",
+  "meta": {
+    "compatibility": "clean-break",
+    "s1_campaign_id": "486dd2349f1eccb2f2ee096447a7c2325e811ecd92b6189722a69ed49a09ad7d",
+    "sampling": "agent_execution_first_no_graph",
+    "goal_nodes": [
+      "atom",
+      "all",
+      "if",
+      "foreach"
+    ],
+    "filter": "common_evaluator_2_of_5",
+    "generated_checker": false
+  }
+}

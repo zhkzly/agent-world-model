@@ -3,8 +3,8 @@
 ## Product intent
 
 Build a paper-grade system that turns a natural-language business Need into a
-real executable Agent environment and samples high-quality training Tasks from
-that environment.
+real executable Agent environment, samples high-quality training Tasks from
+that environment, and supplies verified Episodes to later SFT/RL consumers.
 
 Semantic completion is the product criterion. A demo, MVP, mock, dictionary
 world, canned Task, one successful trace, green unit suite or package-shaped
@@ -16,7 +16,7 @@ artifact is never sufficient evidence.
 natural-language Need
 -> S1 Environment Foundry
 -> qualified immutable EnvironmentRelease
--> S2 Direct Good-Task Sampling Foundry
+-> S2 execution-first Good-Task Sampling Foundry
 -> verified TaskPacks + TaskAssessments + CorpusManifest
 -> S3 acting-Agent Episodes + deterministic Reward/abstention
 -> S4 SFT/RL
@@ -28,82 +28,97 @@ S1 researches the Need, builds one real uv-managed actor project, executes real
 public tools against real persistent state, qualifies environment behavior and
 publishes immutable bytes.
 
-The release exposes two mechanically separated surfaces:
+The Release exposes two mechanically separated surfaces:
 
 ```text
 public actor
   reset / tools / invoke / close
 
-protected trusted runtime
+protected trusted surface
   task-neutral read_state over real persistent facts
 ```
 
-S1 validates actor build/lock identity, ToolSpec and observed schema
+S1 validates actor build/lock identity, ToolSpec and observation schema
 conformance, reset/replay, persistence, isolation, protected readback,
-packaging, relocation and cold preparation. It does not publish CapabilitySpecs,
-conditions, qualification goals, answer fields, positive/noop Task cases,
-TaskSemantics, task-specific auditors, concrete Tasks, reference traces, Task
-checkers, corpus cells, rewards or trajectories.
+packaging, relocation and cold preparation. It does not publish TaskSpace,
+CapabilitySpecs, Goal programs, answers, concrete Tasks, sampling traces,
+Task-specific checkers, rewards or training trajectories.
 
-Physical conformance is necessary but not sufficient. Before publication, one
-fresh semantic reviewer receives the frozen Need-derived BuilderProjection,
-public ToolSpecs and complete Host-executed diagnostic observations with
-protected before/after state. It must judge every frozen Requirement exactly
-once and cite only Host-assigned evidence references. Missing evidence is a
-failure. Framework derives coverage, identities and the release verdict; the
-Builder's tests, scenario expectations and self-report cannot establish
-semantic acceptance. The accepted projection, physical evidence and review are
-bound into the Release evidence without creating Tasks, answers or rewards.
+Before publication, one fresh semantic reviewer receives the frozen
+Need-derived BuilderProjection, public ToolSpecs and complete Host-executed
+diagnostic observations with protected before/after state. It judges every
+frozen Requirement exactly once and cites only Host-assigned evidence
+references. Missing evidence fails. Framework derives coverage, identities and
+the release verdict; Builder tests and self-report cannot establish acceptance.
 
-The protected state projection is environment-specific but Task-neutral. It
-allows S2 checkers to read real before/after facts after close/reopen; it never
-defines success and is never visible to an acting policy.
+Qualification evidence proves that the Release is usable. It is not a complete
+TaskSpace and S2 must not repackage it as the Task corpus.
 
-## S2 owns sampling good Tasks
+## S2 owns sampling Good Tasks
 
-The required S2 path is Direct proposal and physical admission over one exact
-release:
+The sole S2 production path is:
 
 ```text
-Need + Development Brief + public ToolSpecs + fresh execution
--> Candidate Task proposal
--> one sealed TaskContract and task-specific checker
--> freeze checker and final instruction
--> two fresh public-only Agent executions
--> real before/after state, answer and applicable physical challenges
+Need + Development Brief + required coverage target
+-> generic Sampling Agent acts through public tools on a fresh instance
+-> TaskDraft selects a coherent Goal from actual public events
+-> Host resolves public provenance, AnswerProjection and protected effects
+-> Host derives a type-only final-answer schema
+-> fresh public reference replay through one common evaluator
+-> freeze Candidate Goal/evidence/instruction
+-> five fresh public-only Agent runs, at least two passing
 -> TaskPack
 -> separate TaskAssessment
 -> CorpusManifest
 ```
 
-The proposal Agent can suggest a Task but cannot seal truth. One checker project
-is the sole semantic authority for one candidate Task. It consumes real
-before/after state, public trace and final answer; independent Agents may
-challenge and reject it but cannot create a second peer truth program or mutate
-an admitted contract. A failed Task candidate never invalidates its
-EnvironmentRelease.
+The Sampling Agent owns environment-specific semantic exploration. It may
+inspect, branch, iterate and mutate only through public tools. It cannot read
+protected state, author an answer schema, provide expected native facts, write a
+Checker or decide admission.
 
-Graph and Programmatic are optional sampler/search experiments. They may be
-evaluated only after the Direct path demonstrates a concrete coverage gap, and
-must be removable when matched-budget evidence shows no useful non-redundant
-Task gain. They are never required product nodes or Task semantic authority.
+Framework owns SamplingTarget scheduling, public dispatch, trace capture,
+argument provenance, AnswerProjection resolution, protected before/after
+capture, Goal materialization, fresh replay, common evaluation, identity,
+admission and corpus selection.
+
+S2 uses no Tool Graph, random walk, generated TaskSemantics, solution/verifier
+program or per-Task Checker. Adding a new Release may add artifacts and
+measurements but cannot add Framework domain branches or generated evaluator
+code.
+
+### Goal and answer boundary
+
+Tasks use typed `AtomGoal`, `AllGoal`, `IfGoal` and `ForEachGoal` data.
+Unsupported shapes remain typed outcomes and are never fabricated.
+
+Every load-bearing operand comes from an exact Task literal, reset observation
+or prior ToolObservation. An unnamed target must be uniquely determined by
+public evidence; ForEach uses a complete initial public member set. If uses a
+public scalar observed before its branch action.
+
+AnswerProjection copies or assembles public JSON values. Framework derives its
+type-only transport schema from the referenced public schemas. Constants and
+expected values remain trusted evaluator data and are not leaked through
+schema `const` fields.
 
 ### Good Task intrinsic gates
 
 Every admitted Task must be:
 
-- **publicly solvable** using only instruction, reset context, ToolSpecs and
-  ToolObservations;
-- **reliably verifiable** by deterministic outcome/answer/collateral checks that
-  do not require witness-trace equality;
-- **well-posed**: all load-bearing constraints are public, but the solution path
-  and answer key are not leaked;
-- **non-trivial**: no-op, unsupported claims and already-satisfied mutation
+- **publicly solvable:** sampling produced one public solution and at least two
+  of five fresh public runs also pass;
+- **reliably verifiable:** one domain-free common evaluator checks real
+  state, public outcome and grounded final answer without sampling-trace
+  equality;
+- **well-posed:** every load-bearing constraint is public and deterministic for
+  the frozen reset, while the answer and solution route are hidden;
+- **non-trivial:** no-op, unsupported claims and already-satisfied mutation
   goals fail;
-- **replayable and isolated** across fresh instances, with dynamic references
-  rediscovered publicly and declared persistence checked after real reopen;
-- **purposeful**: one natural Need-anchored objective, without arbitrary tool
-  stitching or decorative witness calls.
+- **replayable and isolated:** fresh instances reconstruct the Start and Goal
+  without shared episode state;
+- **purposeful:** objective events form one Need-related user intent without
+  arbitrary tool stitching or decorative required calls.
 
 ### Task corpus quality
 
@@ -111,17 +126,18 @@ Task validity and corpus selection are separate. A corpus additionally needs:
 
 - semantic/execution structure diversity rather than paraphrase diversity;
 - redundancy control;
-- balanced capability, Goal, Start and condition coverage under a declared
-  sampling budget;
+- balanced Goal shape, public tool, outcome, binding and condition/member
+  coverage under a declared sampling budget;
 - model-relative difficulty/cost evidence;
 - later held-out training utility evidence.
 
-Counts and floors are experiment targets, never permission to weaken a Task.
+Simple coverage counters select required shape/tool/outcome targets. They never
+prescribe a tool chain. Counts and floors are experiment targets, never
+permission to weaken a Task.
 
 ## S3 owns verified policy Episodes
 
-S3 consumes exact current Release/TaskPack/Corpus authority and records what a
-target acting policy actually does. Its required order is:
+S3 consumes exact current Release/TaskPack/Corpus authority:
 
 ```text
 cold Release + TaskPack
@@ -129,17 +145,18 @@ cold Release + TaskPack
 -> target policy calls real public tools
 -> preserve complete success or failure trajectory
 -> close and reopen the same native instance
--> execute the frozen Task checker
+-> run the frozen common Goal evaluator
 -> map truth to binary Reward or typed abstention
 -> persist EpisodeRecord / TrainingEpisodeView / EpisodeBatchManifest
 ```
 
-S3 does not generate or re-admit Tasks, alter a checker, choose another corpus or
-train a model. It must retain policy failures rather than only successful
-witnesses and must distinguish model/policy failure from provider,
-environment, semantics, verifier and evidence defects.
+S3 does not generate or re-admit Tasks, alter Goal truth, choose another corpus
+or train a model. The acting policy sees only instruction, fresh reset
+observation, ToolSpecs, prior ToolObservations and the type-only answer schema.
+It never sees S2 sampling/filter evidence, protected Goal data, expected
+branch/member sets, native facts or evaluator internals.
 
-The initial base reward contract is:
+The initial reward contract is:
 
 ```text
 verified success                         -> 1.0
@@ -147,96 +164,78 @@ valid policy episode but Task not met    -> 0.0
 untrustworthy infrastructure/truth path  -> null / abstain
 ```
 
-The acting policy sees only the canonical instruction, fresh reset observation,
-ToolSpecs, prior ToolObservations and final-answer schema. It never sees S2
-witnesses/admission, Start input as a hint, semantic keys, protected bindings,
-expected branch, native facts or checker internals.
-
-S3 owns one small public PolicyDriver boundary and one shared Host execution
-path. The current Responses driver and a later S4 rollout driver must use that
-same path; there is no second Agent loop, service or Registry.
-
 ## Execution ownership
 
 ### Framework Python
 
 Owns environment conformance/publication, release preparation, identities,
-TaskContract/checker freeze and execution, instruction rendering, provenance,
-admission, structural deduplication, TaskPack persistence, assessment
-recording, corpus selection, Episode lifecycle, deterministic
-Reward/abstention and cold artifact projections.
+SamplingTarget scheduling, public execution capture, Goal/evidence freeze,
+AnswerProjection/schema materialization, common evaluation, admission,
+structural deduplication, TaskPack persistence, assessment/corpus recording,
+Episode lifecycle, Reward/abstention and cold artifact projections.
 
 ### Python Codex SDK
 
-Authors only isolated semantic code projects:
-
-1. the S1 executable actor environment, including task-neutral protected state
-   readback;
-2. one S2 task-specific checker for each candidate Task that reaches checker
-   authoring.
-
-Generated code never decides release admission, Task admission, identity or
-reward.
+Authors the S1 executable actor environment, including task-neutral protected
+state readback. S2 does not ask Codex SDK to author Task-specific code.
 
 ### OpenAI Responses tool-calling policy
 
-Runs the exact frozen public Task for S2 solvability witnesses, S2 model-relative
-assessment and S3 target-policy Episodes. It never sees protected bindings,
-native facts, checker internals, a reference path or answer key. S3 may also be
-driven by a later S4 policy adapter through the same restricted public
-interface.
+Performs S2 execution-first Task sampling, five independent recoverability
+runs, model-relative assessment and S3 target-policy Episodes. Filtering and S3
+policies never see protected Goal data, sampling solutions or answer keys.
 
 ## Non-negotiable constraints
 
 1. Public tools execute real project code and real persistent transitions.
-2. Protected state may propose and verify a Task but never supply acting operands.
-3. Checker and final instruction freeze before the witness or target policy executes.
-4. The policy solves exactly the instruction exposed by the TaskPack.
-5. LLM agreement cannot override deterministic execution/state failure.
-6. Acting starts are reset-only; no hidden setup calls or native writes.
-7. Framework contains no booking/SQLite/Git/domain branches.
-8. Witness proves existence of a public solution, never the only valid path.
-9. TaskPack identity excludes assessment, difficulty, corpus policy and Episodes.
-10. Episode reward cannot change Task truth or use TaskAssessment reliability.
-11. Provider/trust defects abstain rather than become model reward zero.
-12. Unsupported semantics and low Task yield remain typed outcomes; they do not revoke a valid Release.
-13. Only current clean-break formats are supported; no compatibility switch.
-14. Intermediate checkpoints, candidate counts and successful demos are never stage completion.
+2. Protected state verifies sampled Tasks but never supplies acting operands.
+3. A Candidate requires successful objective execution and a passing fresh
+   reference replay before it exists.
+4. Goal evidence and final instruction freeze before filter/S3 policy runs.
+5. All five filter outcomes must be valid; at least two must pass.
+6. Serial versus concurrent execution is scheduling only and cannot change
+   Task identity or admission.
+7. LLM agreement cannot override deterministic execution/state failure.
+8. Acting starts are reset-only; no hidden setup calls or native writes.
+9. Framework contains no booking/SQLite/Git/domain branches.
+10. Sampling execution proves one public solution, never the only valid path.
+11. TaskPack identity excludes assessment, difficulty, corpus policy and Episodes.
+12. Episode reward cannot change Task truth or use TaskAssessment reliability.
+13. Provider/trust defects abstain rather than become model reward zero.
+14. Unsupported semantics and low yield do not revoke a valid Release.
+15. Only current clean-break formats are supported; no compatibility switch.
+16. Intermediate checkpoints, candidate counts and successful demos are never
+    stage completion.
 
 ## S2 completion evidence
 
-S2 completes only when the frozen Direct Framework:
+S2 completes only when the frozen production implementation:
 
-- samples, deduplicates and admits Tasks through the production batch API;
-- cold-consumes contrasting filesystem/Git and SQLite releases;
-- produces real query, state-change, refusal, collection/condition and composed
-  Tasks only where executed environment evidence supports them;
-- proves fresh public solvability, reload/isolation and applicable negative
-  discrimination for every admitted TaskPack;
-- cold-reads relocated TaskPacks into a non-leaking PublicTaskView;
-- reports honest yield, rejection attribution, redundancy, distribution and
-  model-relative cost/difficulty;
-- transfers to a post-freeze held-out Need without domain edits;
-- provides the exact Task/truth handoff needed by S3 while leaving scalar reward
-  and training implementation to S3/S4.
-
-Optional Graph/Programmatic experiments are not completion gates.
+- samples, freshly replays, deduplicates and admits Tasks through one batch API;
+- cold-consumes all 20 exact S1 Release/3 artifacts without domain edits;
+- produces real Atom/All/If/ForEach query, transition and refusal Tasks only
+  where public execution and Host evidence support them;
+- completes five valid fresh runs and at least two passes for every admitted
+  TaskPack;
+- cold-reads relocated TaskPacks into a non-leaking PublicTaskView and trusted
+  Goal/evaluator view;
+- reports honest yield, rejection attribution, tool/Goal distribution,
+  redundancy and model-relative cost/difficulty;
+- provides the exact Task/truth handoff needed by S3 while leaving Reward and
+  training implementation to S3/S4.
 
 ## S3 completion evidence
 
 S3 completes only when one frozen runtime:
 
 - consumes relocated Release, TaskPack and Corpus artifacts;
-- preserves complete public trajectories for verified success and policy
-  failure;
-- evaluates Atom, ForEach and If after real close/reopen without witness-trace
-  matching;
-- produces physical `1.0`, `0.0` and typed `null`/abstain outcomes with correct
-  causal ownership;
-- cold-reads immutable EpisodeRecord and non-leaking TrainingEpisodeView
-  artifacts;
-- runs Git, SQLite and the post-freeze held-out release without domain edits;
-- supports the current Responses policy and one second policy/driver identity
-  through the same restricted Host path;
+- preserves complete trajectories for verified success and policy failure;
+- evaluates Atom, All, ForEach and If after real close/reopen without
+  sampling-trace matching;
+- produces physical `1.0`, `0.0` and typed `null`/abstain outcomes with
+  correct causal ownership;
+- cold-reads immutable EpisodeRecord and non-leaking TrainingEpisodeView;
+- supports current Responses and one later S4 policy adapter through the same
+  restricted Host path;
 - hands S4 public trajectories and reward labels without implementing trainer,
   tokenization, logprob or optimizer code.
