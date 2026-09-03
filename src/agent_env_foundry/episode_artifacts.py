@@ -84,10 +84,10 @@ class EpisodeRecord:
             raise ValueError("verification_defect must be an EpisodeDefect or null")
         if not isinstance(self.reward, RewardOutcome):
             raise ValueError("reward must be a RewardOutcome")
-        if (after is None) != (self.evaluation is None):
-            raise ValueError("post_reopen_state and evaluation must both exist or both be null")
-        if self.verification_defect is None and self.evaluation is None:
-            raise ValueError("verification requires evaluation or a verification_defect")
+        if self.evaluation is not None and after is None:
+            raise ValueError("evaluation requires post_reopen_state")
+        if self.verification_defect is None and (after is None or self.evaluation is None):
+            raise ValueError("verification requires state and evaluation or a verification_defect")
         self._validate_reward()
 
     def _validate_reward(self) -> None:

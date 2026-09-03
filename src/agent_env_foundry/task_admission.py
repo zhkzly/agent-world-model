@@ -621,7 +621,7 @@ def _filter_attempt(
         raise TaskAdmissionFailure(
             "FrameworkDefect", "filter_completion_missing", "valid capture omitted completion"
         )
-    trace = _trace_from_capture(capture)
+    trace = evaluation_trace_from_capture(capture)
     failure_codes: list[str] = []
     try:
         origins = derive_argument_origins(
@@ -676,7 +676,9 @@ def _filter_attempt(
     )
 
 
-def _trace_from_capture(capture: PublicEpisodeCapture) -> tuple[TraceEvent, ...]:
+def evaluation_trace_from_capture(capture: PublicEpisodeCapture) -> tuple[TraceEvent, ...]:
+    """Project validated dispatched public calls onto the common evaluator trace."""
+
     calls = (
         call
         for turn in capture.turns
@@ -987,6 +989,7 @@ __all__ = [
     "TaskAdmissionFailureKind",
     "TaskFilterEvidence",
     "TaskPackArtifact",
+    "evaluation_trace_from_capture",
     "filter_candidate",
     "load_task_pack",
     "seal_task_pack",
