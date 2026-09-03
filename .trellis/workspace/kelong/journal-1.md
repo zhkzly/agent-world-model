@@ -120,3 +120,28 @@ Completed and verified the 20-release execution-first sampler: 300 attempts prod
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: Complete S3 verified SFT trajectories
+
+**Date**: 2026-09-04
+**Task**: Complete S3 verified SFT trajectories
+**Branch**: `s3-sft-trajectories`
+
+### Summary
+
+Implemented checker-free multi-Release Episode execution and collected 552 fresh Luna rollouts: 530 verified successes, 22 policy failures, zero abstain/blocked, 69/69 TaskPack and 20/20 Release coverage, 552 local/relocated cold reads, and 530 lossless SFT message reconstructions.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `90494d0` | (see git log) |
+| `ae75fbb` | (see git log) |
+| `5752879` | (see git log) |
+| `c38e2a0` | (see git log) |
+| `830c6eb` | (see git log) |
+
+### Status
+
+[OK] **Completed**
