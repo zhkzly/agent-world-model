@@ -286,6 +286,34 @@ def test_sampling_agent_receives_business_context_without_research_audit_metadat
     assert "evidence_refs" not in str(model_input)
 
 
+def test_sampling_agent_receives_only_public_prior_task_summaries(tmp_path) -> None:
+    client = Client([Response([_call()]), Response([], json.dumps(_terminal()))])
+    summary = {
+        "structure_id": "a" * 64,
+        "goal_shape": "atom",
+        "objective_tools": ["increment"],
+        "outcome_classes": ["transition"],
+        "instruction": "Increase a different counter and report its ID and count.",
+    }
+
+    sample_task_draft(
+        Prepared(),
+        development_brief={"need": "Maintain a persistent counter."},
+        target=_target(),
+        instance_directory=tmp_path / "instance",
+        route=AgentRoute(),
+        prior_accepted_summaries=(summary,),
+        client_factory=lambda **kwargs: client,
+    )
+
+    model_input = json.loads(client.calls[0]["input"][0]["content"])
+    assert model_input["prior_accepted_tasks"] == [summary]
+    assert all(
+        word not in str(model_input["prior_accepted_tasks"]).lower()
+        for word in ("goal_truth", "expected_answer", "trace", "state")
+    )
+
+
 def test_nonempty_trace_with_missing_objective_step_is_rejected(tmp_path) -> None:
     client = Client(
         [

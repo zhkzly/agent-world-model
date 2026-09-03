@@ -86,6 +86,8 @@ protected-state expectation, Python code, or admission verdict.
 The user input contains task_draft_contract with the exact Goal and AnswerProjection syntax
 for this target. Follow those tagged JSON examples exactly; replace example steps, pointers,
 branches, fields, and literals only with values supported by your real public trace.
+prior_accepted_tasks contains public summaries only. Use them to avoid repeating the same
+semantic objective; they are not solution evidence for the new Task.
 """
 
 SamplingFailureKind = Literal[
@@ -221,6 +223,7 @@ def sample_task_draft(
     instance_directory: Path,
     route: AgentRoute | None = None,
     reset_start: JSONObject | None = None,
+    prior_accepted_summaries: Sequence[Mapping[str, Any]] = (),
     client_factory: ClientFactory | None = None,
 ) -> SampledTaskDraft:
     """Let one generic Agent execute, then return a Host-checked TaskDraft."""
@@ -237,6 +240,7 @@ def sample_task_draft(
         raise SamplingFailure(
             "DraftRejected", "reset_start_invalid", "reset_start must be an object or null"
         )
+    summaries = _sampling_summaries(prior_accepted_summaries)
     instance = _fresh_instance_path(instance_directory)
     selected_route = route or AgentRoute()
     factory = client_factory or _default_client_factory
@@ -285,6 +289,7 @@ def sample_task_draft(
                             "development_brief": _sampling_brief(development_brief),
                             "sampling_target": target.to_document(),
                             "task_draft_contract": _task_draft_contract(target),
+                            "prior_accepted_tasks": summaries,
                             "reset_observation": reset_observation,
                         },
                         ensure_ascii=False,
@@ -628,6 +633,55 @@ def _sampling_brief(development_brief: JSONObject) -> JSONObject:
         "selected_world": _object_copy(world_document),
         "requirements": compact,
     }
+
+
+def _sampling_summaries(
+    summaries: Sequence[Mapping[str, Any]],
+) -> list[JSONObject]:
+    if isinstance(summaries, (str, bytes)):
+        raise SamplingFailure(
+            "FrameworkDefect",
+            "prior_task_summaries_invalid",
+            "prior accepted Task summaries must be a sequence of objects",
+        )
+    result: list[JSONObject] = []
+    keys = {
+        "structure_id",
+        "goal_shape",
+        "objective_tools",
+        "outcome_classes",
+        "instruction",
+    }
+    for summary in summaries:
+        document = dict(summary)
+        if set(document) != keys or not is_json_object(document):
+            raise SamplingFailure(
+                "FrameworkDefect",
+                "prior_task_summary_invalid",
+                "a prior accepted Task summary has invalid fields",
+            )
+        structure_id = document["structure_id"]
+        text_fields = (document["goal_shape"], document["instruction"])
+        arrays = (document["objective_tools"], document["outcome_classes"])
+        if (
+            not isinstance(structure_id, str)
+            or len(structure_id) != 64
+            or any(character not in "0123456789abcdef" for character in structure_id)
+            or any(not isinstance(value, str) or not value.strip() for value in text_fields)
+            or any(
+                not isinstance(values, list)
+                or not values
+                or any(not isinstance(value, str) or not value.strip() for value in values)
+                for values in arrays
+            )
+        ):
+            raise SamplingFailure(
+                "FrameworkDefect",
+                "prior_task_summary_invalid",
+                "a prior accepted Task summary has invalid values",
+            )
+        result.append(_object_copy(cast(JSONObject, document)))
+    return result
 
 
 def _task_draft_contract(target: SamplingTarget) -> JSONObject:
