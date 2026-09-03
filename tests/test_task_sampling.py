@@ -370,6 +370,40 @@ def test_sampling_uses_sealed_reset_schema_for_empty_public_answer_arrays(tmp_pa
     }
 
 
+def test_missing_answer_pointer_is_a_typed_draft_rejection(tmp_path) -> None:
+    terminal = _terminal()
+    terminal["answer_json"] = json.dumps(
+        {
+            "kind": "object",
+            "fields": {
+                "missing": {
+                    "kind": "source",
+                    "source": {
+                        "kind": "observation",
+                        "step": 1,
+                        "pointer": "/data/missing",
+                    },
+                }
+            },
+        }
+    )
+    client = Client([Response([_call()]), Response([], json.dumps(terminal))])
+
+    with pytest.raises(SamplingFailure) as caught:
+        sample_task_draft(
+            Prepared(),
+            development_brief={"need": "Maintain a persistent counter."},
+            target=_target(),
+            instance_directory=tmp_path / "instance",
+            route=AgentRoute(),
+            client_factory=lambda **kwargs: client,
+        )
+
+    assert caught.value.kind == "DraftRejected"
+    assert caught.value.code == "draft_answer_projection_invalid"
+    assert "missing" in str(caught.value)
+
+
 def test_off_target_goal_shape_is_rejected_not_counted_as_sampling_success(tmp_path) -> None:
     client = Client([Response([_call()]), Response([], json.dumps(_terminal()))])
 

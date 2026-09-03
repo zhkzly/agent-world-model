@@ -299,7 +299,10 @@ def materialize_answer(
     events = {event.seq: event for event in trace}
     if len(events) != len(trace):
         raise ValueError("answer trace step IDs must be unique")
-    value, schema = _materialize(projection, reset_observation, reset_schema, events, catalog)
+    try:
+        value, schema = _materialize(projection, reset_observation, reset_schema, events, catalog)
+    except (KeyError, IndexError) as exc:
+        raise ValueError(f"answer projection source is unresolved: {exc}") from exc
     if not is_json_object(value):
         raise ValueError("top-level AnswerProjection must resolve to an object")
     return MaterializedAnswer(cast(JSONObject, value), schema)

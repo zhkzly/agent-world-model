@@ -229,6 +229,34 @@ def test_answer_projection_fails_closed_on_missing_or_untyped_sources() -> None:
             tool_specs=(),
         )
 
+    missing_field = AnswerProjection.from_object(
+        {
+            "course_id": AnswerProjection.from_source(
+                PublicValueRef.observation(1, "/data/course_id")
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="course_id"):
+        materialize_answer(
+            missing_field,
+            reset_observation={},
+            reset_schema={"type": "object"},
+            trace=(_event(1, "inspect_course", {"id": "course-1"}),),
+            tool_specs=(
+                {
+                    "name": "inspect_course",
+                    "description": "Inspect one course.",
+                    "input_schema": {"type": "object"},
+                    "output_schema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "required": ["id"],
+                        "additionalProperties": False,
+                    },
+                },
+            ),
+        )
+
 
 def test_foreach_draft_requires_public_members_and_one_atom_per_member_slot() -> None:
     members = PublicValueRef.observation(1, "/data/reservations")
