@@ -36,21 +36,15 @@ def test_scheduler_balances_shapes_outcomes_and_tools_without_a_chain() -> None:
             }
         )
 
-    assert (
-        max(Counter(t.required_goal_shape for t in targets).values())
-        - min(Counter(t.required_goal_shape for t in targets).values())
-        <= 1
-    )
-    assert (
-        max(Counter(t.required_outcome for t in targets).values())
-        - min(Counter(t.required_outcome for t in targets).values())
-        <= 1
-    )
-    assert (
-        max(Counter(t.required_focus_tools[0] for t in targets).values())
-        - min(Counter(t.required_focus_tools[0] for t in targets).values())
-        <= 1
-    )
+    shape_counts = Counter(t.required_goal_shape for t in targets)
+    outcome_counts = Counter(t.required_outcome for t in targets)
+    tool_counts = Counter(t.required_focus_tools[0] for t in targets)
+    assert set(shape_counts) == {"atom", "all", "if", "foreach"}
+    assert set(outcome_counts) == {"query", "transition", "refusal"}
+    assert set(tool_counts) == {"inspect", "mutate", "list"}
+    assert max(shape_counts.values()) - min(shape_counts.values()) <= 1
+    assert max(outcome_counts.values()) - min(outcome_counts.values()) <= 1
+    assert max(tool_counts.values()) - min(tool_counts.values()) <= 1
     assert all(len(t.required_focus_tools) == 1 for t in targets)
     assert all("chain" not in str(t.to_document()).lower() for t in targets)
 
