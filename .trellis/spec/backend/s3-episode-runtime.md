@@ -2,214 +2,140 @@
 
 ## 1. Scope / Trigger
 
-Use this contract when turning one exact current S2 TaskPack or one exact
-single-release CorpusManifest into acting-policy Episodes and the public reward
-view handed to S4.
-
-S3 consumes immutable S1/S2 authority. It never generates, repairs, re-admits
-or reselects Tasks, and it contains no trainer, retry scheduler, service,
-Registry or domain branch.
+Use this contract when executing current checker-free `TaskPack/1` artifacts as
+policy Episodes or handing their public trajectories to S4. S3 consumes exact
+S1/S2 authority and owns capture, post-reopen evaluation, reward and immutable
+Episode artifacts. It does not generate Tasks or train models.
 
 ## 2. Signatures
 
 ```python
-capture_public_episode(
-    *,
-    actor: Environment,
-    instruction: str,
-    reset_observation: JSONValue,
-    answer_schema: JSONObject,
-    policy_driver: PolicyDriver,
-) -> PublicEpisodeCapture
-
 run_task_episode(
-    prepared: OpenPreparedRelease,
-    task_pack_path: Path,
-    expected_task_pack_id: str,
+    prepared: OpenPreparedReleaseV3,
+    task_pack: TaskPackArtifact,
+    request: EpisodeRequest,
     *,
+    instance_directory: Path,
     policy_driver: PolicyDriver,
-    rollout_index: int,
-    instance_root: Path,
 ) -> EpisodeRecord
 
-write_episode_bundle(output_root: Path, record: EpisodeRecord) -> TrainingEpisodeView
+write_episode_bundle(output_root: Path, record: EpisodeRecord) -> Path
 read_episode_bundle(output_root: Path, episode_id: str) -> TrainingEpisodeView
+read_episode_record(output_root: Path, episode_id: str) -> EpisodeRecord
 
-run_episode_batch(
-    prepared: OpenPreparedRelease,
-    task_store_root: Path,
-    corpus_manifest_path: Path,
-    expected_corpus_id: str,
-    output_root: Path,
+run_episode_campaign(
     *,
-    policy_spec: PolicySpec,
-    policy_driver_factory: Callable[[], PolicyDriver],
+    s1_campaign_root: Path,
+    s2_campaign_root: Path,
+    output_root: Path,
+    source_commit: str,
+    expected_s1_campaign_id: str,
+    expected_corpus_manifest_id: str,
+    route: AgentRoute,
     rollouts_per_task: int,
-) -> EpisodeBatchManifest
+    workers: int,
+) -> EpisodeCampaignResult
 ```
 
-Current TaskPack formats are exactly `atom-task-pack/4`,
-`foreach-task-pack/3` and `if-task-pack/3`.
+Current persisted formats are `episode-record/3`,
+`training-episode-view/2`, `episode-slot-result/1` and
+`episode-batch-manifest/2`.
 
 ## 3. Contracts
 
-### Policy and public capture
-
-- `PolicySpec` contains model, driver kind/version, normalized non-secret route,
-  prompt digest and the one positive Host turn limit. It contains no credential,
-  path, retry or generic config bag.
-- One `PolicyDriver` belongs to one Episode. It receives public input and prior
-  public observations, makes one decision per Host call and is closed by the
-  Host. It cannot reset, invoke, inspect or check.
-- The Host snapshots ToolSpecs once, validates and dispatches calls, records raw
-  invalid material and derives checker TraceEvents only from dispatched calls.
-- Provider-private reasoning is never stored.
-
-### Exact Task lifecycle and reward
-
-The concrete S3 lifecycle is:
-
 ```text
-acting_open -> reset -> capture_terminal -> pre_close_inspect -> acting_close
--> reopened_open -> post_reopen_inspect -> checker_evaluated -> reopened_close
+cold Release + cold TaskPack
+-> fresh instance and one reset
+-> existing Host-owned public policy loop
+-> complete calls/observations/final answer
+-> close and reopen the same instance without reset
+-> common Goal evaluator over real state, trace and answer
+-> 1.0 / 0.0 / null
+-> paired trusted/public Episode artifact
 ```
 
-- Reopen uses the same native directory, a distinct session and no reset.
-- Atom/ForEach/If use the existing AtomCheckRequest and ConditionCheckRequest
-  documents. The checker trace, final answer and facts must agree with the one
-  public capture.
-- `ReloadEvidence/1` remains the exact legacy S2 projection and uses
-  `episode_complete`, not `capture_terminal`. It exists only for a completed,
-  defect-free, full lifecycle.
-- Reward is closed:
-
-```text
-completed + checker satisfied + no defect -> verified_success / 1.0
-healthy policy terminal or checker failed -> verified_failure / 0.0
-provider/infrastructure/trust defect       -> abstain / null
-```
-
-Any defect takes precedence over satisfying state. TaskAssessment, witnesses
-and corpus reliability never affect reward.
-
-### Record and TrainingEpisodeView
-
-`EpisodeRecord` identity binds request, policy, complete capture, Host policy
-elapsed time, native/session lifecycle, fact digests, exact checker documents,
-optional ReloadEvidence and RewardOutcome. Paths are absent.
-
-Bundles are paired:
-
-```text
-episodes/<episode_id>/EpisodeRecord.json
-episodes/<episode_id>/TrainingEpisodeView.json
-```
-
-The paired reader reconstructs and validates the Record first, derives the
-expected view, requires exact equality with the canonical view file and returns
-only the derived `TrainingEpisodeView`. There is no independent view reader or
-view identity.
-
-The view contains IDs, full EpisodeRequest, exact public input, public turns
-without usage, completion and disposition/reward. It excludes PolicySpec
-details, defects/owners, usage, elapsed time, native/lifecycle/facts, checker
-data, ReloadEvidence, S2 evidence and hidden reasoning.
-
-### Exact Corpus batch
-
-- A batch accepts one expected canonical `corpus-manifest/1` whose entries all
-  use the prepared Release.
-- TaskPacks resolve only at
-  `<task_store_root>/batch/taskpacks/<task_pack_id>/<current filename>`.
-- All valid requests and authority-blocked slots freeze in Corpus order and
-  1-based rollout order before the first driver factory call.
-- Execution is serial, one fresh driver and one attempt per valid request. There
-  is no retry.
-- Invalid TaskPack authority creates no request; pre-input failures after a
-  request create request-bound blocked slots. Unattributed failures abort.
-- Every returned Episode is paired-written and cold-read. Publication failure
-  aborts without a final manifest or fabricated remainder.
-- Aggregates are recomputed from persisted Records and blocked slots. Missing
-  usage is explicit; monetary cost is not claimed.
+- Policy input is exactly system prompt, instruction, reset observation,
+  ToolSpecs, prior ToolObservations and type-only answer schema.
+- S2 sampling/reference/filter evidence, Goal truth, expected answer and
+  protected state never reach the policy or `TrainingEpisodeView`.
+- `EpisodeRecord/3` binds request, PolicySpec, materialization, complete capture
+  including provider error details, protected before/post-reopen state,
+  evaluation and reward.
+- `TrainingEpisodeView/2` is derived from the trusted Record. It keeps ordered
+  public turns/calls/observations/final answer and reward, but omits usage and
+  all trusted truth.
+- The evaluator checks exact reset, before/after state, answer schema/value and
+  recursive Atom/All/If/ForEach Goal. It does not compare with an S2 path.
+- The batch is multi-Release. Each result carries its own Release/TaskPack/Task
+  request binding; there is no top-level single-Release assumption.
+- Eight logical rollouts per TaskPack are fixed before execution. Release-level
+  concurrency changes scheduling only, never request or Episode identity.
 
 ## 4. Validation & Error Matrix
 
-| Condition | Required result |
-| --- | --- |
-| noncanonical/wrong TaskPack before request | typed Task authority failure; no Episode |
-| malformed embedded If branch | reject before policy call |
-| reset/preflight fails after request, before public input | no Episode; request-bound blocked batch slot |
-| healthy refusal/malformed call/missing answer/turn budget | complete policy-failure capture; checker runs; reward `0.0` |
-| explicit provider or infrastructure defect after public input | retain capture and lifecycle; reward `null` with exact owner |
-| unattributed driver/runtime exception | abort; do not guess owner or publish training evidence |
-| reopen/checker evidence incomplete | typed abstain; never verified failure |
-| checker trace/final answer/facts differ from capture | Record rejection |
-| view differs from derived Record projection | paired-reader rejection |
-| partial/symlink/noncanonical bundle | paired-reader rejection |
-| duplicate Episode directory | collision; existing bytes unchanged |
-| multi-release Corpus or prepared-Release mismatch | whole batch rejected before output/provider use |
-| missing/invalid TaskPack in valid Corpus | every affected rollout blocked with no fabricated request |
-| reused/mismatched driver | request-bound evidence block; no policy call |
-| same-Task trusted pre-input defect | remaining frozen rollouts blocked; no repeat attempt |
-| Episode publication/cold-read failure | abort batch; no final manifest/fake remainder |
+| Condition | Result |
+|---|---|
+| trustworthy completion and evaluator pass | `verified_success / 1.0` |
+| trustworthy policy/evaluator failure | `verified_failure / 0.0` |
+| provider, environment or truth-path defect | `abstain / null` |
+| authority failure before sealable Episode | blocked slot with owner/code/phase/details |
+| wrong/missing Release or TaskPack binding | reject before policy use |
+| state changes across close/reopen | abstain; never policy zero |
+| record/view mutation under old ID | paired cold-read rejection |
+| old `/1` or `/2` trusted Episode format | unsupported; no adapter |
+| missing or duplicate request slot | final batch rejection |
+
+Provider/private reasoning is neither requested nor fabricated. Public terminal
+text and all public function calls are retained. A provider exception must keep
+its status/original code/message in trusted capture details.
 
 ## 5. Good / Base / Bad Cases
 
-- Good: a completed Atom mutates real state, closes/reopens, passes the frozen
-  checker, persists/relocates and returns view reward `1.0`.
-- Good: a policy mutates state then omits its answer; the full trajectory and
-  checker evidence survive and reward is `0.0`.
-- Good: a provider defect after public activity yields a relocated paired view
-  with `reward=null`, while owner details stay only in the Record.
-- Base: one exact Corpus serially retains success, failure, abstain and blocked
-  slots with reconciled aggregates.
-- Bad: retry a failed policy, trust a view without its Record, derive reward from
-  TaskAssessment, copy checker codes into the view, or add a domain-specific
-  Task branch.
+- Good: real state and final answer satisfy the frozen Goal after reopen, giving
+  `1.0` and an SFT-visible complete public trajectory.
+- Base: a valid policy attempt reaches the wrong answer or misses a Goal; its
+  trace is retained with `0.0` and excluded from positive SFT.
+- Good failure: an HTTP/provider defect retains the public prefix and exact
+  machine details with `null`.
+- Bad: trust tool `ok`, final text, an LLM Judge, S2 reliability, or a reference
+  trace as Episode success.
 
 ## 6. Tests Required
 
-- Contract tests for structural JSON snapshots, policy/request identity and the
-  complete RewardOutcome truth table.
-- Host tests for raw malformed calls, one ToolSpec snapshot, owner separation,
-  single-use/close and Responses continuation.
-- Runtime tests for all three Task kinds, lifecycle order, no second reset,
-  checker/capture/facts binding, 1/0/null and pre-input no-Record behavior.
-- Artifact tests for exact view keys, structural leakage exclusion, fresh-ID
-  malformed checker rejection, tamper, partial, symlink, collision and
-  relocation.
-- Batch tests for prefreeze-before-factory, fresh drivers, no retry, every slot,
-  owner/stop behavior, publication abort and cold aggregate reconciliation.
-- Mutation licences must kill reward precedence, lifecycle order, If embedded
-  authority, view leakage/Record bypass, dropped slots and aggregate changes.
-- Stage evidence must include exact Git, SQLite and held-out maintenance
-  authorities plus one live Responses batch and one scripted second driver.
+- Physical success, wrong-answer and provider-defect Episodes through one real
+  Release process.
+- Reward mutations independently kill `1.0`, `0.0` and `null` swaps.
+- Record/View exact-shape, identity, canonical-byte, symlink, partial and
+  relocation tests.
+- Corpus/Release/TaskPack cross-binding and 1..N request-grid tests.
+- Resume tests reject changed terminal slots and missing/duplicate fan-in.
+- Public traversal proves zero protected/S2/evaluator leakage.
+- A real campaign must cold-read every pair and reconstruct successful
+  `messages + tools` without trusted data.
 
 ## 7. Wrong vs Correct
 
 Wrong:
 
-```python
-view = json.loads((bundle / "TrainingEpisodeView.json").read_text())
-train(view)  # trusts a projection with no Record verification
+```text
+Luna says done -> save as SFT success
 ```
 
 Correct:
 
-```python
-view = read_episode_bundle(output_root, expected_episode_id)
-# Reader cold-validates EpisodeRecord and exact projection before returning.
+```text
+Luna trajectory -> real close/reopen -> common evaluator -> reward
+-> SFT later selects only cold reward=1 views
 ```
 
 Wrong:
 
-```python
-while not success:
-    record = run_task_episode(...)  # retry-until-success changes the rollout
+```text
+copy old checker-bound S3 or refill failures until every rollout succeeds
 ```
 
 Correct:
 
-```python
-record = run_task_episode(...)  # exactly one attempt; failure is retained
+```text
+one current TaskPack path, one attempt per fixed slot, every outcome retained
 ```

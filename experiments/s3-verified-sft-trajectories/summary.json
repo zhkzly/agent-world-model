@@ -1,0 +1,90 @@
+{
+  "format": "s3-verified-sft-resume-evidence/1",
+  "source_commit": "c38e2a0d685e24a6bae7f515745c840017c9876a",
+  "s1_campaign_id": "486dd2349f1eccb2f2ee096447a7c2325e811ecd92b6189722a69ed49a09ad7d",
+  "s2_corpus_manifest_id": "7ce6f07703acf6a60f4c67ff784f18bfac75821f1c47ba979fc7a553288f186e",
+  "campaign_id": "7884245f6d992fd5673a0c9b6f5e93e183ad6251b9a408c5cf8995b55ec6ced1",
+  "batch_id": "a654e1031f7039e6d9faea58ab592466d9a723d0fb68b60b37f6b7000575e23e",
+  "summary_id": "d87bfe9d51a88b6428fd1d63c951a93de2d5149bce03065b2d0984a5bb0ee153",
+  "artifact_root": "/home/kelong/pycodes/foundry-s3-verified-episodes/7884245f6d992fd5673a0c9b6f5e93e183ad6251b9a408c5cf8995b55ec6ced1",
+  "configuration": {
+    "model": "gpt-5.6-luna",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "rollouts_per_task": 8,
+    "worker_limit": 8,
+    "max_provider_turns": 24
+  },
+  "result": {
+    "requested_episodes": 552,
+    "sealed_episodes": 552,
+    "verified_success": 530,
+    "verified_failure": 22,
+    "abstain": 0,
+    "blocked": 0,
+    "verified_success_rate": 0.9601449275362319,
+    "success_task_pack_coverage": 69,
+    "task_pack_count": 69,
+    "success_release_coverage": 20,
+    "release_count": 20,
+    "minimum_successes_per_task_pack": 5,
+    "sft_ready": true
+  },
+  "trajectory": {
+    "provider_turns": 1769,
+    "attempted_tool_calls": 1709,
+    "dispatched_tool_calls": 1709,
+    "tool_calls_min": 1,
+    "tool_calls_median": 2,
+    "tool_calls_mean": 3.1,
+    "tool_calls_p95": 7,
+    "tool_calls_max": 12,
+    "messages_min": 5,
+    "messages_median": 7,
+    "messages_max": 20
+  },
+  "verified_success_diversity": {
+    "atom": 247,
+    "all": 134,
+    "if": 141,
+    "foreach": 8,
+    "query_goal_memberships": 284,
+    "transition_goal_memberships": 196,
+    "refusal_goal_memberships": 112,
+    "normalized_task_action_answer_routes": 132,
+    "routes_per_task_min": 1,
+    "routes_per_task_median": 1,
+    "routes_per_task_mean": 1.91,
+    "routes_per_task_max": 8
+  },
+  "verified_failure": {
+    "atom": 9,
+    "all": 2,
+    "if": 11,
+    "foreach": 0,
+    "reason_occurrences": {
+      "answer_mismatch": 16,
+      "goal_unsatisfied": 6,
+      "atom_missing": 4,
+      "condition_unresolved": 2
+    }
+  },
+  "cost": {
+    "input_tokens": 2785184,
+    "output_tokens": 133261,
+    "total_tokens": 2918445,
+    "wall_clock_ms": 970309
+  },
+  "artifact_size_bytes": {
+    "episode_records": 11080248,
+    "training_episode_views": 8391149,
+    "paired_distribution_payload": 19471397,
+    "full_campaign_with_instances_and_caches": 2076332899
+  },
+  "validation": {
+    "cold_read_episode_pairs": 552,
+    "relocated_cold_read_episode_pairs": 552,
+    "sft_rows_reconstructed": 530,
+    "public_view_leaks": 0
+  },
+  "claim_boundary": "This result establishes current multi-Release S3 Episode collection, complete public trajectory capture, post-reopen common-Goal reward, and tokenizer-neutral SFT-ready views. It does not claim S4 curation, Parquet/tokenizer integration, model training, or learning improvement."
+}

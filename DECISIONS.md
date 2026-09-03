@@ -378,3 +378,11 @@ Host re-resolves every reference-solution argument from Task/reset/prior
 ToolObservation values and snapshots state after each replayed call. A mutation
 outside DraftGoal is rejected before Candidate creation; infrastructure,
 environment and draft failures retain separate owners.
+
+`s3-verified-sft-trajectories|介入1|返工1|552 fresh Episodes+post-reopen Goal reward+paired cold views+7 mutation licences|红线违反0`
+
+The first full campaign exposed one evidence loss: typed provider failures kept
+their owner/code but dropped already-derived HTTP/original details. The current
+capture binds those details in trusted EpisodeRecord/3, rejects /2, and the
+fresh final campaign completed 552 slots with 530 verified successes, 22 policy
+failures and zero abstain/blocked results.
