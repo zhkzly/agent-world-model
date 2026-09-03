@@ -411,7 +411,6 @@ def test_only_current_runtime_skills_are_packaged() -> None:
     assert {path.parent.name for path in skill_files} == {
         "research",
         "environment-codegen",
-        "task-checker-codegen",
     }
     assert Path(skill.path) in skill_files
     assert "search_sources" in skill.text

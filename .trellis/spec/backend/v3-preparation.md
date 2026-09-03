@@ -17,7 +17,7 @@ with prepared.open(instance_directory) as session:
     session.actor.tools()
     session.actor.invoke(...)
 
-snapshot = prepared.read_state(instance_directory)  # Host/checker only
+snapshot = prepared.read_state(instance_directory)  # Host evaluator only
 ```
 
 - `open` never resets or deletes the caller-owned instance.

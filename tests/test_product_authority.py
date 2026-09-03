@@ -158,3 +158,24 @@ def test_current_backend_specs_expose_only_v3_environment_authority() -> None:
         in normalized_preparation
     )
     assert "TaskSemantics" in publication and "rejected as prohibited members" in publication
+
+
+def test_generated_checker_and_legacy_direct_task_path_are_physically_absent() -> None:
+    for relative in (
+        "src/agent_env_foundry/checker_author.py",
+        "src/agent_env_foundry/_checker_runner.py",
+        "src/agent_env_foundry/task_contract.py",
+        "src/agent_env_foundry/runtime_skills/task-checker-codegen",
+    ):
+        assert not (ROOT / relative).exists(), relative
+
+    production = "\n".join(
+        path.read_text(encoding="utf-8") for path in (ROOT / "src/agent_env_foundry").rglob("*.py")
+    )
+    for obsolete in (
+        "checker_brief",
+        "generated_task_checker",
+        "propose_task_direct",
+        "execute_task_checker",
+    ):
+        assert obsolete not in production
