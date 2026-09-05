@@ -1,8 +1,8 @@
-{"file":"AGENTS.md","reason":"Project authority, discussion versus implementation boundary, and correct Trellis task routing."}
-{"file":"PROJECT.md","reason":"Preserve public/protected separation, execution-first task truth, fresh reset, five-run admission and S3 reward responsibilities; reconcile intentional contract changes explicitly."}
-{"file":"DECISIONS.md","reason":"Preserve accepted ownership, clean-break and anti-duplication decisions while implementing the complete task."}
-{"file":".trellis/workflow.md","reason":"Planning artifacts, channel-worker context ordering, independent checks, and one final task completion."}
-{"file":".trellis/spec/backend/v3-preparation.md","reason":"Reuse the locked actor runtime, immutable Release preparation and task-neutral protected readback."}
-{"file":".trellis/spec/backend/v3-conformance-publication.md","reason":"Keep genuine environment conformance, publication identities and cold artifact boundaries."}
-{"file":".trellis/spec/backend/s2-good-task-sampler.md","reason":"Current TaskDraft, replay, public recoverability and TaskPack authority to evolve without parallel truth paths."}
-{"file":".trellis/spec/backend/s3-episode-runtime.md","reason":"Official Episode lifecycle, policy capture, close/reopen verification, reward and downstream public view contracts."}
+{"file":"AGENTS.md","reason":"Planning is not activation; use the existing task and preserve project authority and user changes."}
+{"file":"PROJECT.md","reason":"Reuse the working S1/S2/S3 ownership and public/trusted boundaries; synchronize only actual authorized contract changes."}
+{"file":"DECISIONS.md","reason":"Read current and superseding decisions; preserve anti-overdesign and do not resurrect removed legacy paths."}
+{"file":".trellis/workflow.md","reason":"Use current Trellis context ordering and implement/check workers; one final complete delivery."}
+{"file":".trellis/spec/backend/v3-preparation.md","reason":"Reuse immutable Release preparation, fresh instances and protected readback; no new environment loader."}
+{"file":".trellis/spec/backend/v3-conformance-publication.md","reason":"Preserve real native conformance and publication identities; missing artifacts are not replaceable mock results."}
+{"file":".trellis/spec/backend/s2-good-task-sampler.md","reason":"Adapt the existing draft/replay/admission path with fixed intent and bounded endpoint verification, not a parallel sampling truth system."}
+{"file":".trellis/spec/backend/s3-episode-runtime.md","reason":"Official disk-loaded TaskPack consumption, shared verdicts, reopen reward and paired cold views."}

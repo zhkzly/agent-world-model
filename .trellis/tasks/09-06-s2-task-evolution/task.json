@@ -1,8 +1,8 @@
 {
   "id": "s2-task-evolution",
   "name": "s2-task-evolution",
-  "title": "Implement complete execution-verified S2 task evolution and S3 integration",
-  "description": "Deliver the complete intent-grounded S2 task evolution method: prerequisite, discovery and related-outcome operators, bounded path-open verification, shared S2/probe/S3 validation, efficient-solver feedback, dependency audits, lineage, recursive scheduling, recovery, CLI, tests, real campaigns and relocation cold-read evidence.",
+  "title": "Implement bounded S2 task evolution on the working Foundry pipeline",
+  "description": "One complete delivery of prerequisite, discovery and related-outcome task expansion, frozen-intent execution, necessary route-verification repairs, efficient-solver feedback, bounded recursion, deduplication, real TaskPack/S3 integration and evaluation. Reuse the working runtime; no universal state-mapping system or blanket artifact-format migration.",
   "status": "planning",
   "dev_type": "backend",
   "scope": "s2-task-evolution",
@@ -27,21 +27,20 @@
     "src/agent_env_foundry/task_goal.py",
     "src/agent_env_foundry/task_admission.py",
     "src/agent_env_foundry/public_agent.py",
-    "src/agent_env_foundry/episodes.py",
     "src/agent_env_foundry/episode_runtime_v2.py",
     "src/agent_env_foundry/episode_artifacts.py",
-    "src/agent_env_foundry/preparation_v3.py",
     "scripts/run_s2_task_campaign.py"
   ],
-  "notes": "One complete implementation deliverable, not staged product versions. Planning artifacts have been prepared; no task.py start, implementation dispatch, code execution, or live validation has been performed by this task-creation change. The user-provided local worktree must be verified by the implementing session, not assumed accessible from GitHub.",
+  "notes": "Scope revised after the overdesign review. The current prd/design/implement files replace the prior broad R01-R10 specification, rather than adding a second plan. This is a complete bounded algorithm task, not staged product versions. No runtime implementation, task activation, worker dispatch or live campaign is performed by this planning change.",
   "meta": {
     "delivery_mode": "single_complete_delivery",
-    "planning_source_commit": "786e770811aecfbde904b9b251cf7b07a0eb06d1",
+    "scope_revision": "bounded-existing-pipeline-2026-09-06",
+    "planning_source_commit": "17a87ab7dfddcd48a7f523375b0d385ea9af685f",
     "reviewed_code_baseline": "e02595a4044419ae755f13f02e21237f1c935171",
     "known_working_code_commit": "1a6d3421315fc1e1c07961b54f950814ea21d40c",
-    "migrated_design_blob": "9637a1771e3066ba54901bc36b67aa04f2488240",
+    "superseded_design_blob": "9637a1771e3066ba54901bc36b67aa04f2488240",
     "requested_worktree": "/home/kelong/pycodes/foundry-s3-sft-trajectories",
     "activation": "not_started",
-    "full_scope": "R01-R10"
+    "full_scope": "R01-R10 as redefined in the current prd.md"
   }
 }

@@ -1,101 +1,83 @@
-# S2 Task Evolution — Complete Delivery PRD
+# S2 任务递进采样：完整交付 PRD
 
-## Task state and authority
+> 更新：2026-09-06。状态：planning，尚未启动实现。  
+> 本次收敛替代旧规格，不与旧版 R01–R10 并列生效。旧内容保留在 Git 历史。  
+> 一个完整实现任务，不分需要用户反复批准的产品版本。
 
-This is the Trellis task for the user's requested complete implementation. It is currently `planning`, not an active or completed implementation. Creating these artifacts does not start workers or modify runtime contracts.
+## 1. 要解决的问题
 
-Parent: `08-26-foundry-paper-product`. This task has no staged child releases. Internal dependency ordering, commits and review checkpoints belong to one complete delivery and must not become requests for the user to approve a partial version.
+当前 Foundry 已有真实环境、S2 采样/replay/准入、TaskPack 发布和 S3 执行/重开验证链路，但已采任务偏向局部查询与少量状态操作。用户要的是：在原有 Good Task 约束下采到业务更完整、具有更多有效信息和状态依赖的任务，而不是让 Teacher 绕路或强制调用次数。
 
-Read `AGENTS.md`, `PROJECT.md` and `DECISIONS.md` first. `prd.md` defines requirements and acceptance; `design.md` preserves the full implementation specification; `implement.md` defines execution, validation and review. Existing product invariants remain binding. Changes to current task representation and verification are proposed by this task and must be explicitly reconciled with product/spec documents during authorized implementation, not silently overridden by the design.
+本任务完整实现：**业务扩展提出候选 → 冻结子任务 → fresh 执行与原有验证 → 独立高效求解 → 短解原因反馈 → 有限递进 → 正式 TaskPack 和 S3 消费 → 独立效果评估。**
 
-## Goal
+不得以实现一组类、一个算子、手工 canary、全绿单元测试或只产出 Candidate 作为最终交付。也不得把用户的“全部实现”解释成重建所有相关基础设施。
 
-Improve the quality of tasks sampled from the already working Foundry environments. Increase genuine information/state dependencies and coherent business work, while preserving public solvability, real execution, fresh replay, deterministic verification, isolation and correct acceptance of supported alternative routes.
+## 2. 基线与权限
 
-The objective is to improve tasks, not to make an acting model waste tool calls. Correct shorter solutions remain successful. Length is an assessment and corpus-selection property, never a public minimum-call requirement or an extra S3 reward.
+- 仓库：`zhkzly/agent-world-model`；分支：`s3-sft-trajectories`。
+- 本次规划读取的 HEAD：`17a87ab7dfddcd48a7f523375b0d385ea9af685f`；已跑通代码：`1a6d3421315fc1e1c07961b54f950814ea21d40c`。两者之间为规划/文档改动，不是新算法成果。
+- 用户本机目录：`/home/kelong/pycodes/foundry-s3-sft-trajectories`；实现者需实际确认存在、HEAD 和未提交修改。
+- 沿用父任务 `08-26-foundry-paper-product`；不新建同名任务或切换别的会话的 active-task 指针。
+- 用户当前只要求准备计划。之后明确启动实现时，再依 Trellis 工作流执行 `task.py start`；任务创建不等于运行授权。
 
-## User requirements
+读取 `AGENTS.md`、`PROJECT.md`、`DECISIONS.md` 和当前 backend specs。历史决定存在被后续版本替代的内容，应按当前产品契约和确实存在的代码核对，不能恢复已删除的 v2/TaskSemantics 路线。本次计划不自动改写产品契约；授权实现中的必要语义变更要同步到相应 spec。
 
-- Use the working `s3-sft-trajectories` lineage, not an older default branch or a substitute environment.
-- Deliver the complete algorithm, necessary shared-runtime adaptations, tests, CLI, real execution and reports. Do not stop after a prototype, one operator, a canary, or passing unit tests.
-- Preserve the existing environment releases, historical artifacts and user modifications.
-- Do not require the user to assemble disconnected modules or authorize the next internal checkpoint repeatedly after implementation has been authorized.
-- Separate code completion, live validation and measured algorithm effects. Do not invent successful runs, force task-length targets, or guarantee an improvement before experiments.
+## 3. 明确的支持范围
 
-## Baseline and inputs
+在既有 Release 的合法 reset 下，处理**对象公开可唯一确定、参数和答案可由现有公开来源表达、业务结果可用稳定原生终态投影验收**的任务。允许完整流程由多个真实动作完成，允许不同查询与不同写入路线达到同一正确终态。
 
-- Repository: `zhkzly/agent-world-model`.
-- Task base branch: `s3-sft-trajectories`.
-- Planning source HEAD: `786e770811aecfbde904b9b251cf7b07a0eb06d1`.
-- Reviewed code baseline: `e02595a4044419ae755f13f02e21237f1c935171`.
-- Previously working code: `1a6d3421315fc1e1c07961b54f950814ea21d40c`.
-- User-provided worktree: `/home/kelong/pycodes/foundry-s3-sft-trajectories`; verify it locally before use.
+“唯一对象/稳定终点”不等于“只有一个工具调用”。例如从早期请求状态出发定位对象、完成合法前置阶段并达到业务终点，可能自然需要多次交互。
 
-The full specification previously at `docs/plans/s2-task-evolution-implementation.md` is now this task's `design.md`, migrated without changing its content. The old path is a navigation stub, not a second maintained specification. Its September 5 design date is retained; this Trellis task was created September 6, 2026.
+不宣称覆盖任意合法终态：若不同合法对象、动态 ID、历史顺序或自由文本使完整终态/答案比较拒绝正确解，必须修复已界定的小范围问题，或把该候选标成表示阻塞并排除；不能偷偷指定参考选择或把假阴性当成任务难度。全部候选都被排除，不能宣布解决了任务偏短的问题。
 
-Real Release, TaskPack and Episode inputs must be resolved from existing manifests and verified identities. Paths written in reports are discovery hints, not evidence that the files exist in the implementing runtime. No new S1 generation may silently replace unavailable historical inputs.
+## 4. 完整必交范围
 
-## Complete required scope
-
-| ID | Required capability | Acceptance evidence |
+| ID | 必交内容 | 验收重点 |
 |---|---|---|
-| R01 | Frozen intent and isolated Scout/Proposer, Witness, Extractor and independent solving | Actual public-input captures, immutable intent identities, leak and goal-shrinking rejection tests |
-| R02 | O1 prerequisite, O2 object discovery and O3 related-outcome expansion | Implemented operators, feasible/infeasible tests, real proposals and per-operator outcomes |
-| R03 | Qualified reset-only starts, full public execution and fresh replay | Start/release identities, real native observations, replay and persistence evidence |
-| R04 | Bounded path-open result/necessary-process validation and public provenance | Explicit bindings and clause coverage; valid alternative-route and invalid-result tests |
-| R05 | One task-validation semantics shared by S2, complexity probes and S3 | Same-capture parity tests, typed defects, post-reopen reward tests |
-| R06 | Efficient profiles, fixed-budget probes, local dependency audits and short-route diagnosis feedback | Correct profile digests, probe budget/route records, E1/E2 evidence and matched-task results |
-| R07 | Instance deduplication, semantic grouping, lineage and leakage-aware splits | Direct-ID/discovery distinction, paraphrase handling, family and split collision tests |
-| R08 | Bounded recursive search, budget allocation, concurrency, recovery and complete failure accounting | Frozen schedules, resume/idempotency tests, budget enforcement and retained terminal records |
-| R09 | Official TaskPack publication, disk reload and S3 consumption | Real S3 rollouts, close/reopen verification, local and relocated paired artifact reads |
-| R10 | Working CLI, current-format readers, automated tests, real campaigns, comparisons and completion report | Actual commands, logs, output identities, comparison metrics and requirement-to-test traceability |
+| R01 | 固定子任务要求；提案与执行上下文隔离 | 执行后不能缩题；被隐藏的 ID 不从父任务进入执行者 |
+| R02 | 前置条件、对象发现、关联结果三种扩展 | 三种操作共用一个提案器和执行链，不硬编码业务成功路线 |
+| R03 | 沿用真实执行、公开来源、fresh replay 和 2-of-5 准入 | 不拼轨迹、不隐藏 setup、不取消副作用检查 |
+| R04 | 修复辅助读绑定和纯结果任务的参考写路线约束 | 使用既有终态证据的最小修复；有效替代路线与错误路线都有测试 |
+| R05 | 高效策略的真实提示/摘要接入；S2/probe/S3 判定口径一致 | 不绕过 digest，不让未公开参数构成合法短解 |
+| R06 | 固定预算短解探测、有效增量记录和诊断反馈 | 参考长度不等于任务长度；无成功探测时不捏造长度 |
+| R07 | 合理去重、根/父子谱系和有限递归 | 发现型任务不被粗结构键吞掉；改写/换 ID 不冒充新家族 |
+| R08 | 复用现有批处理，补齐配置、断点续跑和全部失败记账 | 不建设新服务、调度平台或恢复半修改实例 |
+| R09 | 正式 TaskPack 落盘重载、既有 S3 rollout 和迁移冷读 | 不能只测内存对象；旧产物不覆盖、不重标 |
+| R10 | 自动测试、跨环境真实运行、强基线及一项核心消融、最终报告 | 工程跑通、任务变好、训练收益严格分开 |
 
-The precise contracts, supported assertion types, operator definitions, format changes, budgets and test IDs are in `design.md`, sections 2–14. They are required design details, not optional future work.
+这些项是同一次完整交付的要求。内部按依赖实现和多次回归，不构成第一版/第二版。
 
-## Constraints
+## 5. 不纳入本任务的工程
 
-- No hidden setup, direct database mutation for task initialization, Scout-state reuse, or stitched traces presented as one fresh successful execution.
-- No per-task Python Checker or Framework business-domain branch. Supported deterministic assertions are interpreted by one bounded kernel.
-- Every acting role receives only its authorized public inputs. Hidden truth, parent answers, reference paths and target lengths stay out of those inputs.
-- Keep five valid fresh admission runs and at least two passes. Infrastructure retries are bounded and separate; semantic failures are not retried until success.
-- Keep S3 reward semantics `1 / 0 / null`. A known verifier dispute cannot be reclassified as useful task difficulty or an ordinary negative example.
-- Do not disable provenance, snapshot or digest checks merely to make the new path run.
-- Do not turn unsupported multi-solution, arithmetic or process semantics into hidden reference-answer constraints.
-- Record all relevant costs, failed proposals, truncated runs and unresolved defects. Test fixtures do not establish real algorithm effectiveness.
+不建立跨环境实体/原生字段自动映射系统、通用结果/时序 DSL、任意程序性参数求解或新任务专属 Checker；不强制拆出 Scout/Witness/Extractor 等多个长期 Agent 子系统；不预先升级所有产物格式；不新增旧格式运行平台、服务、注册中心、队列、数据库、成本学习调度器或自动跨根语义聚类平台。
 
-## Out of scope
+不改造 S1 来凑目标长度，不做跨 Release 超级任务、任意多解优化、任意嵌套循环、S4 训练、全局最短解证明。现有测试、状态回读、公开/受保护隔离和冷读验证不能以精简为名削弱。
 
-S4 model training; training the task generator; arbitrary executable parameter programs; unrestricted optimization or multi-solution tasks; cross-Release super-environments; arbitrary nested loops; proofs of a global shortest solution. These boundaries do not excuse omission of R01–R10.
+## 6. 完成与效果的判定
 
-## Acceptance criteria
+### 工程交付
 
-### Implementation and integration
+- [ ] R01–R10 已接通；没有 TODO、默认通过、固定样例冒充算法或生产旁路。
+- [ ] `implement.md` 的行为测试、已有回归、lint/type 检查均有实际命令与结果；已存在的问题和新回归分开记录。
+- [ ] 所有新增语义都有版本/身份依据；只升级确实改变的契约，受影响的 writer/reader/消费者同步完成。
+- [ ] 新任务正式封装后从磁盘重载，经过 S3、post-reopen 和本地/迁移冷读。
+- [ ] 运行入口能够检查真实输入、执行、恢复、验证和生成比较报告，不要求用户手工组装 Python 调用。
 
-- [ ] R01–R10 are implemented, connected and mapped to code/tests, with no placeholder success path or unimplemented mandatory operator.
-- [ ] All applicable tests in `design.md` section 13 exist and pass; lint/type/unit/integration results are recorded.
-- [ ] Shared policy profiles, source validation, budgets, native-state bindings and artifact identities agree across producers and consumers.
-- [ ] Current-format writers/readers and the explicit baseline seed-export path work without overwriting or silently relabelling historical artifacts.
-- [ ] `doctor`, `run`, `resume`, `verify` and `compare` are real CLI entrypoints, not README-only commands.
-- [ ] Default behavior and historical baseline remain auditable; new runtime changes have focused regression evidence.
+### 真实方法验收
 
-### Real environment validation
+- [ ] 在至少三个已核验的真实 Release 上按固定预算运行；选择理由和不适用环境也留档，不替换成 mock。
+- [ ] 三种算子均执行真实自动提案，分别报告有效、无增长、任务失败和环境/表示阻塞；至少两个算子有正式准入成果，至少一个根出现第二轮准入后代。
+- [ ] 正式新任务覆盖至少两个 Release、至少六个根家族；没有达到就明确验收差距，不能反复重跑挑成功批次。
+- [ ] 代表案例的新增业务阶段/信息依赖与执行证据对应；正确短解不会被判错来维持长度。
+- [ ] 运行直接覆盖、完整意图直接生成、完整递进，以及去掉短解反馈的消融；共用支持范围、验证与最终探测，完整记录成本。
+- [ ] 有冻结后的独立探测与任务/根家族加权统计，不把准入结果或多条 rollout 冒充独立测试样本。
 
-- [ ] Real source manifests and Release identities are checked; missing credentials/inputs are reported as actual external blockers, not replaced by mocks.
-- [ ] The configured automatic algorithm runs on at least three actual suitable Releases. Every proposal has a terminal record.
-- [ ] O1/O2/O3 each produce real executed proposals and outcome reports; at least two operators publish tasks on distinct roots, and at least one family has an admitted second recursive expansion.
-- [ ] Every selected TaskPack is read back from disk and consumed by the official S3 runtime for configured rollouts. Success, failure and null outcomes are all retained.
-- [ ] All sealed artifacts pass local and relocated cold reads with matching identities, public projections and reward records.
+以上数量是本任务验收目标，不是已有结果或允许降低正确性要求的理由。实现者在约定预算内解决自己引入的问题；若资源不足或效果目标未达到，保留实际结果和阻塞，不伪造完成，也不擅自扩大课题。
 
-### Independent evaluation and completion
+最终报告分别给出 `implementation_complete`、`live_integration_passed`、`evaluation_completed` 和 `effect_status`。效果目标是：相对强直接意图基线，更多真实且去冗余后仍为多步的任务，或透明的质量—成本改善；建议观察 5–8/9–15 次区间，但不把调用下限写进题目/reward。没有效果证据不能说顾虑已解决；没有 S4 实验不能说模型能力已提升。
 
-- [ ] `direct_coverage`, `intent_direct`, `evolution_without_shortcut_feedback` and `evolution` comparisons use common environment/validation/reporting rules and account for all costs.
-- [ ] Final independent probes are separate from selection/admission evidence. Task/family counts are not inflated by repeated rollout counts.
-- [ ] Report `L_best_all`, protocol-bound `L_best_probe`, successful probe counts, truncation, dependency evidence, family coverage and failure causes.
-- [ ] `completion-report.json` records `implementation_complete`, `live_validation_complete`, `evaluation_complete` and `effect_status` separately, with exact commits, commands and artifact IDs.
-- [ ] The full delivery is not marked complete while mandatory live/evaluation evidence is absent. Honest external blockers remain explicit; effect status may be `improved`, `inconclusive` or `not_improved` according to actual evidence.
+## 7. 交接
 
-## Handoff
+当前 `prd.md` 定义需求，`design.md` 定义收敛后的算法和必要适配，`implement.md` 定义落实与验证。旧版通用映射、全套迁移、独立 Extractor、必跑逐题干预系统等不再是隐藏的完成条件。
 
-Implementation starts only when the implementing session is instructed to start this task and runs the repository's `task.py start`. After that authorization, execute the complete task under the Trellis workflow; do not ask for another approval at every internal checkpoint.
-
-No code, worker, local active-task pointer, or live run is created by the planning-artifact commit itself.
+之后的实施 AI 启动本任务并完整推进，不在中间检查点要求用户批准下一版本。确有外部缺文件、凭据或服务问题时明确报告并留下可恢复入口；不能仅凭设计文档保证所有运行必然成功。

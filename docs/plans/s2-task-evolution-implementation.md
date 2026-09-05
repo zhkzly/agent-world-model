@@ -1,22 +1,21 @@
-# Foundry S2 task evolution — Trellis task entry
+# S2 task evolution — Trellis task entry
 
-The complete implementation specification has moved into the repository's
-Trellis task. This file is a navigation entry, not a second implementation
-specification.
+The maintained plan is the existing Trellis task:
 
-**Task:** `.trellis/tasks/09-06-s2-task-evolution`
-
-- [Requirements and acceptance criteria](../../.trellis/tasks/09-06-s2-task-evolution/prd.md)
-- [Complete technical specification](../../.trellis/tasks/09-06-s2-task-evolution/design.md)
-- [Execution, validation and review plan](../../.trellis/tasks/09-06-s2-task-evolution/implement.md)
+- [Requirements and complete acceptance](../../.trellis/tasks/09-06-s2-task-evolution/prd.md)
+- [Bounded algorithm and integration design](../../.trellis/tasks/09-06-s2-task-evolution/design.md)
+- [Implementation, tests and real validation](../../.trellis/tasks/09-06-s2-task-evolution/implement.md)
 - [Task metadata](../../.trellis/tasks/09-06-s2-task-evolution/task.json)
 
-The complete prior specification was preserved byte-for-byte in `design.md`
-from Git blob `9637a1771e3066ba54901bc36b67aa04f2488240`. It was not shortened
-into a prototype or divided into partial product releases. Context manifests
-are provided in the task as `implement.jsonl` and `check.jsonl`.
+Task path: `.trellis/tasks/09-06-s2-task-evolution`.
 
-The task is prepared in `planning`. It has not been activated, implemented or
-live-validated by this documentation migration. After the user instructs the
-implementation session to start it, that session should validate and start the
-existing Trellis task, then deliver its complete R01–R10 scope.
+The September 6 scope revision keeps the complete three-operator evolution,
+short-route feedback, finite recursion, real TaskPack/S3 integration and
+evaluation, while removing the previous universal state-mapping system,
+mandatory separate Extractor, blanket artifact migration and new runtime
+infrastructure. Required route-verification repairs and real tests remain.
+
+The former broader specification is retained only in Git history; it is not
+an additional acceptance checklist. This entry does not duplicate the design.
+The task is `planning`: implementation, activation and live validation have
+not been performed by this planning update.

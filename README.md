@@ -15,27 +15,27 @@ constitutes a released environment or a completed live campaign. Product
 intent, stage boundaries, and working rules live in `PROJECT.md`,
 `DECISIONS.md`, and `AGENTS.md`.
 
-## S2 task evolution: complete Trellis implementation task
+## S2 task evolution: bounded complete Trellis task
 
-The [S2 task evolution Trellis task](.trellis/tasks/09-06-s2-task-evolution/prd.md)
-contains the requirements and acceptance criteria for one complete end-to-end
-deliverable. The [technical specification](.trellis/tasks/09-06-s2-task-evolution/design.md)
-retains the full prior design, and the [execution plan](.trellis/tasks/09-06-s2-task-evolution/implement.md)
-defines integration, validation, review and completion. Curated
-`implement.jsonl` and `check.jsonl` supply the worker spec context.
+The [S2 task evolution task](.trellis/tasks/09-06-s2-task-evolution/prd.md)
+defines one complete algorithm delivery on the working pipeline, not staged
+product versions. Read its [design](.trellis/tasks/09-06-s2-task-evolution/design.md)
+and [implementation plan](.trellis/tasks/09-06-s2-task-evolution/implement.md)
+with the curated `implement.jsonl` and `check.jsonl`.
 
-The scope includes frozen intent, all three expansion operators, bounded
-path-open verification, shared S2/probe/S3 validation, efficient solving,
-dependency audits, deduplication, lineage, recursive scheduling, recovery,
-CLI and current-format integration, automated tests, real campaigns,
-relocation cold reads and independent comparisons. Internal checkpoints do
-not constitute separate product releases or final delivery.
+The current scope includes prerequisite, discovery and related-outcome
+expansion, frozen-intent execution, necessary endpoint/route verification
+repairs, efficient-solver feedback, finite recursion, deduplication, official
+TaskPack/S3 integration, real cold reads and independent comparisons.
+It does not require a universal state-mapping system, a separate Extractor
+subsystem, blanket artifact-format migration or replacement runtime services.
+The earlier broader specification is superseded, not an extra hidden checklist.
 
-The task is **planning**, not implemented functionality or evidence of improved
-model/task performance. On an implementation instruction, the implementing
-session should validate and start this existing task using the repository's
-Trellis workflow; no activation or runtime change is performed by its creation.
-Report code completion, live validation and measured effects separately.
+The task is **planning**. Its algorithm, including the proposed minimal
+`FinalStateGoal` support, is not implemented functionality or evidence of
+improved performance. After an implementation instruction, the local session
+should validate and start this existing task, then report code completion,
+real integration and measured effects separately.
 
-The former [plan URL](docs/plans/s2-task-evolution-implementation.md) remains a
-navigation entry to the task, not another maintained specification.
+The former [plan URL](docs/plans/s2-task-evolution-implementation.md) is only a
+navigation entry to the Trellis task.
