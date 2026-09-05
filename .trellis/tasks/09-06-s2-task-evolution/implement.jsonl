@@ -1,0 +1,8 @@
+{"file":"AGENTS.md","reason":"Project authority, discussion versus implementation boundary, and correct Trellis task routing."}
+{"file":"PROJECT.md","reason":"Preserve public/protected separation, execution-first task truth, fresh reset, five-run admission and S3 reward responsibilities; reconcile intentional contract changes explicitly."}
+{"file":"DECISIONS.md","reason":"Preserve accepted ownership, clean-break and anti-duplication decisions while implementing the complete task."}
+{"file":".trellis/workflow.md","reason":"Planning artifacts, channel-worker context ordering, independent checks, and one final task completion."}
+{"file":".trellis/spec/backend/v3-preparation.md","reason":"Reuse the locked actor runtime, immutable Release preparation and task-neutral protected readback."}
+{"file":".trellis/spec/backend/v3-conformance-publication.md","reason":"Keep genuine environment conformance, publication identities and cold artifact boundaries."}
+{"file":".trellis/spec/backend/s2-good-task-sampler.md","reason":"Current TaskDraft, replay, public recoverability and TaskPack authority to evolve without parallel truth paths."}
+{"file":".trellis/spec/backend/s3-episode-runtime.md","reason":"Official Episode lifecycle, policy capture, close/reopen verification, reward and downstream public view contracts."}

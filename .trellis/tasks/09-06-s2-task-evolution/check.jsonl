@@ -1,0 +1,8 @@
+{"file":"AGENTS.md","reason":"Check that the implementation follows the authorized task and does not treat planning or partial worker progress as product completion."}
+{"file":"PROJECT.md","reason":"Audit public solvability, protected truth isolation, real execution, reset-only starts and reward ownership against stable product constraints."}
+{"file":"DECISIONS.md","reason":"Check clean-break handling, no per-task checker code, no business-domain branches and no duplicated execution authority."}
+{"file":".trellis/workflow.md","reason":"Independent channel review, exact evidence, final integration and completion criteria."}
+{"file":".trellis/spec/backend/v3-preparation.md","reason":"Audit original Release identity, instance isolation, native-state reads and relocation without hidden caches."}
+{"file":".trellis/spec/backend/v3-conformance-publication.md","reason":"Distinguish environment defects, substituted artifacts and unsupported semantics from genuine policy failures."}
+{"file":".trellis/spec/backend/s2-good-task-sampler.md","reason":"Check five-run admission, failure accounting, task identities, public provenance and equivalent-solution acceptance."}
+{"file":".trellis/spec/backend/s3-episode-runtime.md","reason":"Check parity with S2/probe verification, prompt and policy identities, post-reopen reward, paired artifact reads and non-leaking SFT-ready views."}

@@ -15,23 +15,27 @@ constitutes a released environment or a completed live campaign. Product
 intent, stage boundaries, and working rules live in `PROJECT.md`,
 `DECISIONS.md`, and `AGENTS.md`.
 
-## S2 task evolution: complete implementation specification
+## S2 task evolution: complete Trellis implementation task
 
-The [complete S2 task evolution specification](docs/plans/s2-task-evolution-implementation.md)
-defines one end-to-end implementation deliverable, not a sequence of partial
-product releases. Its required scope includes frozen intent, prerequisite,
-discovery and related-outcome expansion, bounded result verification, shared
-S2/probe/S3 validation, efficient solving, dependency audits, deduplication,
-lineage, recursive scheduling, recovery, CLI integration, format updates,
-automated tests, real campaign execution, relocation cold reads, and evaluation.
+The [S2 task evolution Trellis task](.trellis/tasks/09-06-s2-task-evolution/prd.md)
+contains the requirements and acceptance criteria for one complete end-to-end
+deliverable. The [technical specification](.trellis/tasks/09-06-s2-task-evolution/design.md)
+retains the full prior design, and the [execution plan](.trellis/tasks/09-06-s2-task-evolution/implement.md)
+defines integration, validation, review and completion. Curated
+`implement.jsonl` and `check.jsonl` supply the worker spec context.
 
-Read section 0 for the complete scope and completion conditions, sections 10–14
-for interfaces, formats, commands, tests, and live validation, and section 15
-for the implementation-agent handoff. Internal checkpoints do not constitute
-final delivery.
+The scope includes frozen intent, all three expansion operators, bounded
+path-open verification, shared S2/probe/S3 validation, efficient solving,
+dependency audits, deduplication, lineage, recursive scheduling, recovery,
+CLI and current-format integration, automated tests, real campaigns,
+relocation cold reads and independent comparisons. Internal checkpoints do
+not constitute separate product releases or final delivery.
 
-The specification is **not implemented functionality or evidence of improved
-model/task performance**. This documentation change does not itself activate
-an implementation task or change runtime product contracts. During an
-authorized implementation, synchronize the actual contracts and report code
-completion, live validation, and measured effects separately.
+The task is **planning**, not implemented functionality or evidence of improved
+model/task performance. On an implementation instruction, the implementing
+session should validate and start this existing task using the repository's
+Trellis workflow; no activation or runtime change is performed by its creation.
+Report code completion, live validation and measured effects separately.
+
+The former [plan URL](docs/plans/s2-task-evolution-implementation.md) remains a
+navigation entry to the task, not another maintained specification.
