@@ -19,3 +19,15 @@ evidence in the active Trellis task.
 
 Product intent, stage boundaries and working rules live in `PROJECT.md`,
 `DECISIONS.md` and `AGENTS.md`; this file only describes the code package.
+
+## Planned S2 task evolution
+
+The [S2 task evolution implementation plan](docs/plans/s2-task-evolution-implementation.md)
+contains the reviewed design for intent-grounded prerequisite/discovery
+expansion, independent efficient solving, task deduplication, dependency
+assessment, tests, and the PR0–PR5 implementation sequence.
+
+This is a **design proposal, not implemented functionality**. It does not
+change the current product contracts or activate an implementation task.
+Read section 0 for the overview, sections 15–16 for the implementation order
+and handoff, and sections 12–13 for interfaces and test cases.
